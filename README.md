@@ -1,4 +1,4 @@
-# UU Remote & Tencent HTTPDNS TLS Fix
+# Campus TLS Fix (UU 远程 & QQ/微信图片加载缓慢修复工具)
 
 <p align="left">
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6?logo=windows" alt="Windows 10/11" />
@@ -24,11 +24,11 @@
 
 - **国内镜像加速通道**：
   ```powershell
-  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/uu-remote-tls-fix/main/install.ps1 | iex
+  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/campus-tls-fix/main/install.ps1 | iex
   ```
 - **GitHub 官方通道**：
   ```powershell
-  irm https://raw.githubusercontent.com/yunyancuo/uu-remote-tls-fix/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/yunyancuo/campus-tls-fix/main/install.ps1 | iex
   ```
 
 ### 方式二：下载压缩包双击修复
@@ -40,7 +40,7 @@
 
 - **在线卸载**：
   ```powershell
-  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/uu-remote-tls-fix/main/uninstall.ps1 | iex
+  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/campus-tls-fix/main/uninstall.ps1 | iex
   ```
 - **本地双击卸载**：双击运行 **`一键卸载恢复.bat`**。
 
@@ -71,7 +71,7 @@
 - **本地双击修复（推荐）**：解压后直接双击运行 **`一键修复QQ微信图片缓慢.bat`**（会自动请求管理员权限完成配置并打印 5 个域名的实测耗时）。
 - **PowerShell 在线一键修复（默认 TLS 分片直连模式）**：
   ```powershell
-  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/uu-remote-tls-fix/main/fix-qq-wechat.ps1 | iex
+  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/campus-tls-fix/main/fix-qq-wechat.ps1 | iex
   ```
 - **切换为 FastFail（0.0.0.0 秒回退）模式**：
   ```powershell
@@ -80,12 +80,12 @@
 - **独立卸载并恢复 QQ / 微信默认配置**：
   双击运行 **`一键恢复QQ微信默认.bat`**，或在管理员 PowerShell 中运行：
   ```powershell
-  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/uu-remote-tls-fix/main/unfix-qq-wechat.ps1 | iex
+  irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/campus-tls-fix/main/unfix-qq-wechat.ps1 | iex
   ```
 
 ---
 
-## 工作原理架构
+## 工作原理架构与局域网/手机共享
 
 ```text
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -97,6 +97,8 @@
 │  本机无窗口守护进程: UUTlsFragmenter.exe (0.0.0.0:17899 / :443 / DNS :53)  │
 │  - 双帧标准 TLS Record 切分: 对 *.nrd.nie.163.com 及 5 个腾讯 HTTPDNS 域名 │
 │    的首包 TLS ClientHello 在 SNI 字段中间切分为 2 个符合 RFC 规范的帧     │
+│  - 校园网内网 DNS 动态继承: 局域网 DNS (:53) 自动读取本机物理网卡配置的   │
+│    上游 IPv4 DNS，保证路由器/手机共享修复时仍可正常解析并打开学校内网网站 │
 │  - 网关智能优选: 通过公共 DoH (223.5.5.5) 解析支持多帧重组的官方低延迟节点 │
 │  - 降级自愈: 自动将已降级的 80 端口明文请求透明升级为 443 加密 TLS 通道   │
 │  - 物理网卡直连: 出站 Socket 直接绑定本机物理网卡 (以太网/WLAN) 发出      │
@@ -107,12 +109,20 @@
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 路由器 / 手机 Wi-Fi 局域网共享配置
+
+如果希望同一路由器下的手机也同步修复 UU 远程和 QQ / 微信图片加载缓慢，同时**不影响手机打开学校内网网站**：
+1. 在运行了本工具的电脑上查看本机局域网 IPv4 地址（例如 `192.168.x.x`）；
+2. 在路由器后台 DHCP DNS 设置（或手机 Wi-Fi 的手动 DNS 设置）中：
+   - **首选 DNS**：填写电脑的局域网 IP（由本机 `:53` 端口拦截被阻断的 11 个域名，其余所有校内网站与普通网站自动转发给电脑网卡上原有的校园网 DNS 解析）；
+   - **备选 DNS**：填写学校原本的校园网 DNS（电脑关机或休眠时手机自动回退，不影响正常上网和打开校内网站）。
+
 ---
 
 ## 项目结构
 
 ```text
-uu-remote-tls-fix/
+campus-tls-fix/
 ├── install.ps1                  # UU 远程一键修复主脚本（支持 irm ... | iex 在线执行）
 ├── uninstall.ps1                # UU 远程一键卸载与恢复脚本
 ├── 一键修复UU远程.bat            # Windows 双击修复 UU 远程启动器
