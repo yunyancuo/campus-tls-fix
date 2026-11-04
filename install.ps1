@@ -397,25 +397,72 @@ namespace UURemoteTlsFix
                     }
                 }
 
-                // Forward other DNS queries to 223.5.5.5:53 bound to physical NIC
-                using (Socket fSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                // Forward other DNS queries to physical NIC's configured IPv4 DNS servers first (e.g. campus intranet DNS), fallback to 223.5.5.5
+                List<IPAddress> upstreams = GetPhysicalDnsServers(lanIp);
+                foreach (IPAddress upDns in upstreams)
                 {
-                    fSock.ReceiveTimeout = 2500;
-                    fSock.SendTimeout = 2500;
-                    fSock.Bind(new IPEndPoint(lanIp, 0));
-                    fSock.SendTo(req, new IPEndPoint(IPAddress.Parse("223.5.5.5"), 53));
-                    byte[] rBuf = new byte[512];
-                    EndPoint upEp = new IPEndPoint(IPAddress.Any, 0);
-                    int rn = fSock.ReceiveFrom(rBuf, ref upEp);
-                    if (rn > 0)
+                    try
                     {
-                        byte[] outB = new byte[rn];
-                        Buffer.BlockCopy(rBuf, 0, outB, 0, rn);
-                        udp.SendTo(outB, clientEp);
+                        using (Socket fSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                        {
+                            fSock.ReceiveTimeout = 1500;
+                            fSock.SendTimeout = 1500;
+                            fSock.Bind(new IPEndPoint(lanIp, 0));
+                            fSock.SendTo(req, new IPEndPoint(upDns, 53));
+                            byte[] rBuf = new byte[1024];
+                            EndPoint upEp = new IPEndPoint(IPAddress.Any, 0);
+                            int rn = fSock.ReceiveFrom(rBuf, ref upEp);
+                            if (rn > 0)
+                            {
+                                byte[] outB = new byte[rn];
+                                Buffer.BlockCopy(rBuf, 0, outB, 0, rn);
+                                udp.SendTo(outB, clientEp);
+                                return;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        private static List<IPAddress> GetPhysicalDnsServers(IPAddress lanIp)
+        {
+            List<IPAddress> list = new List<IPAddress>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    IPInterfaceProperties props = ni.GetIPProperties();
+                    bool match = false;
+                    foreach (UnicastIPAddressInformation uni in props.UnicastAddresses)
+                    {
+                        if (uni.Address != null && uni.Address.Equals(lanIp))
+                        {
+                            match = true;
+                            break;
+                        }
+                    }
+                    if (!match) continue;
+
+                    foreach (IPAddress dns in props.DnsAddresses)
+                    {
+                        if (dns.AddressFamily == AddressFamily.InterNetwork && !dns.Equals(lanIp))
+                        {
+                            string s = dns.ToString();
+                            if (!s.StartsWith("127.") && !s.StartsWith("198.18.") && !list.Contains(dns))
+                                list.Add(dns);
+                        }
                     }
                 }
             }
             catch { }
+
+            IPAddress fallback = IPAddress.Parse("223.5.5.5");
+            if (!list.Contains(fallback)) list.Add(fallback);
+            return list;
         }
 
         private static IPAddress DetectPhysicalIp()
