@@ -256,6 +256,7 @@ namespace UURemoteTlsFix
             {
                 udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                try { udp.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch { }
                 udp.Bind(new IPEndPoint(physIp, DnsPort));
                 Log("Listening LAN DNS on " + physIp + ":" + DnsPort + " (for Router / Wi-Fi devices)");
 
@@ -263,7 +264,15 @@ namespace UURemoteTlsFix
                 while (true)
                 {
                     EndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                    int n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
+                    int n = 0;
+                    try
+                    {
+                        n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
+                    }
+                    catch (SocketException)
+                    {
+                        continue;
+                    }
                     if (n <= 12) continue;
 
                     byte[] reqCopy = new byte[n];
@@ -901,6 +910,15 @@ if ($effectiveMode -eq "Fragment" -and -not $port443Ready) {
 }
 
 Set-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -Value "`"$exePath`""
+if ($isAdmin) {
+    Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
+        $_.DisplayName -match 'uutlsfragmenter|UURemoteTlsFix' -and $_.Action -eq 'Block'
+    } | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP","UURemoteTlsFix-LAN-UDP" -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP" -Direction Inbound -Action Allow -Program $exePath -Protocol TCP -LocalPort 443,17899 -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    New-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-UDP" -Direction Inbound -Action Allow -Program $exePath -Protocol UDP -LocalPort 53 -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    Write-Ok "已配置 Windows 防火墙局域网放行规则 (UDP :53 / TCP :443, :17899)"
+}
 Write-Ok "已注册开机静默自启 (HKCU\...\Run\UURemoteTLSFragmenter)"
 
 # ----------------------------------------------------------------------

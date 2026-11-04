@@ -183,6 +183,7 @@ namespace UURemoteTlsFix
             {
                 udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                try { udp.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch { }
                 udp.Bind(new IPEndPoint(physIp, DnsPort));
                 Log("Listening LAN DNS on " + physIp + ":" + DnsPort + " (for Router / Wi-Fi devices)");
 
@@ -190,7 +191,15 @@ namespace UURemoteTlsFix
                 while (true)
                 {
                     EndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                    int n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
+                    int n = 0;
+                    try
+                    {
+                        n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
+                    }
+                    catch (SocketException)
+                    {
+                        continue;
+                    }
                     if (n <= 12) continue;
 
                     byte[] reqCopy = new byte[n];
