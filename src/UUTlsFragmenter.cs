@@ -52,6 +52,7 @@ namespace UURemoteTlsFix
         private static readonly int MainPort = 17899;
         private static readonly int TransparentTlsPort = 443;
         private static readonly int DnsPort = 53;
+        private static string BaseDir;
         private static string LogPath;
         private static readonly object LogLock = new object();
 
@@ -59,6 +60,16 @@ namespace UURemoteTlsFix
         private static DateTime _cachedPhysIpTime = DateTime.MinValue;
         private static readonly ConcurrentDictionary<string, Tuple<string, DateTime>> DnsCache =
             new ConcurrentDictionary<string, Tuple<string, DateTime>>();
+
+        private static readonly HashSet<string> TencentHttpDnsHosts =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "dns.qq.com",
+                "dns.weixin.qq.com",
+                "dns.weixin.qq.com.cn",
+                "httpdns.kg.qq.com",
+                "dns.wechat.com"
+            };
 
         private static readonly Dictionary<string, string> FallbackHostIps =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -72,14 +83,19 @@ namespace UURemoteTlsFix
                 { "uuyc.163.com", "59.111.44.89" },
                 { "uuyc.webapp.163.com", "117.148.172.102" },
                 { "nrd-ugc.fp.ps.netease.com", "111.3.79.64" },
-                { "fp.ps.netease.com", "111.3.79.64" }
+                { "fp.ps.netease.com", "111.3.79.64" },
+                { "dns.qq.com", "119.29.29.229" },
+                { "dns.weixin.qq.com", "120.204.0.63" },
+                { "dns.weixin.qq.com.cn", "120.204.0.63" },
+                { "httpdns.kg.qq.com", "117.135.175.48" },
+                { "dns.wechat.com", "43.152.112.101" }
             };
 
         [STAThread]
         public static void Main(string[] args)
         {
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            LogPath = Path.Combine(baseDir, "uu_tls_fragmenter.log");
+            BaseDir = AppDomain.CurrentDomain.BaseDirectory;
+            LogPath = Path.Combine(BaseDir, "uu_tls_fragmenter.log");
 
             bool createdNew;
             using (Mutex mutex = new Mutex(true, @"Local\UURemoteTlsFragmenterNativeMutex", out createdNew))
@@ -115,6 +131,21 @@ namespace UURemoteTlsFix
                 }
             }
             catch { }
+        }
+
+        private static string GetTencentDnsLanMode()
+        {
+            try
+            {
+                string modeFile = Path.Combine(BaseDir, "qq_wechat_mode.txt");
+                if (File.Exists(modeFile))
+                {
+                    string m = File.ReadAllText(modeFile, Encoding.UTF8).Trim().ToLowerInvariant();
+                    if (m == "fastfail" || m == "nxdomain" || m == "off") return m;
+                }
+            }
+            catch { }
+            return "fragment";
         }
 
         private static async Task StartListenerAsync(IPAddress bindAddr, int port)
@@ -179,6 +210,38 @@ namespace UURemoteTlsFix
             }
         }
 
+        private static void SendDnsARecord(Socket udp, IPEndPoint clientEp, byte[] req, int qEnd, IPAddress ip, string qname, string tag)
+        {
+            byte[] resp = new byte[qEnd + 16];
+            Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+            resp[2] = 0x81; resp[3] = 0x80; // Standard query response, no error
+            resp[6] = 0x00; resp[7] = 0x01; // 1 answer
+            resp[8] = 0x00; resp[9] = 0x00;
+            resp[10] = 0x00; resp[11] = 0x00;
+            int aOff = qEnd;
+            resp[aOff] = 0xC0; resp[aOff + 1] = 0x0C; // Name pointer
+            resp[aOff + 2] = 0x00; resp[aOff + 3] = 0x01; // Type A
+            resp[aOff + 4] = 0x00; resp[aOff + 5] = 0x01; // Class IN
+            resp[aOff + 6] = 0x00; resp[aOff + 7] = 0x00; resp[aOff + 8] = 0x00; resp[aOff + 9] = 0x3C; // TTL 60s
+            resp[aOff + 10] = 0x00; resp[aOff + 11] = 0x04; // Data len 4
+            byte[] ipBytes = ip.GetAddressBytes();
+            Buffer.BlockCopy(ipBytes, 0, resp, aOff + 12, 4);
+            udp.SendTo(resp, clientEp);
+            Log("[" + tag + "] " + qname + " -> " + ip + " (for " + clientEp.Address + ")");
+        }
+
+        private static void SendDnsEmptyOrNxDomain(Socket udp, IPEndPoint clientEp, byte[] req, int qEnd, byte rcode)
+        {
+            byte[] resp = new byte[qEnd];
+            Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+            resp[2] = 0x81;
+            resp[3] = (byte)(0x80 | (rcode & 0x0F));
+            resp[6] = 0x00; resp[7] = 0x00;
+            resp[8] = 0x00; resp[9] = 0x00;
+            resp[10] = 0x00; resp[11] = 0x00;
+            udp.SendTo(resp, clientEp);
+        }
+
         private static void HandleDnsQuery(Socket udp, IPEndPoint clientEp, byte[] req, IPAddress lanIp)
         {
             try
@@ -202,36 +265,39 @@ namespace UURemoteTlsFix
 
                 if (qname.EndsWith(".nrd.nie.163.com") || qname == "nrd.nie.163.com")
                 {
-                    if (qtype == 1) // A record -> return LAN IP so Wi-Fi device connects to our port 443 transparent fragmenter
+                    if (qtype == 1)
                     {
-                        byte[] resp = new byte[qEnd + 16];
-                        Buffer.BlockCopy(req, 0, resp, 0, qEnd);
-                        resp[2] = 0x81; resp[3] = 0x80; // Standard query response, no error
-                        resp[6] = 0x00; resp[7] = 0x01; // 1 answer
-                        resp[8] = 0x00; resp[9] = 0x00;
-                        resp[10] = 0x00; resp[11] = 0x00;
-                        int aOff = qEnd;
-                        resp[aOff] = 0xC0; resp[aOff + 1] = 0x0C; // Name pointer
-                        resp[aOff + 2] = 0x00; resp[aOff + 3] = 0x01; // Type A
-                        resp[aOff + 4] = 0x00; resp[aOff + 5] = 0x01; // Class IN
-                        resp[aOff + 6] = 0x00; resp[aOff + 7] = 0x00; resp[aOff + 8] = 0x00; resp[aOff + 9] = 0x3C; // TTL 60s
-                        resp[aOff + 10] = 0x00; resp[aOff + 11] = 0x04; // Data len 4
-                        byte[] ipBytes = lanIp.GetAddressBytes();
-                        Buffer.BlockCopy(ipBytes, 0, resp, aOff + 12, 4);
-                        udp.SendTo(resp, clientEp);
-                        Log("[LAN-DNS] " + qname + " -> " + lanIp + " (for " + clientEp.Address + ")");
+                        SendDnsARecord(udp, clientEp, req, qEnd, lanIp, qname, "LAN-DNS-UU");
                         return;
                     }
-                    else if (qtype == 28) // AAAA -> return empty NOERROR so client uses IPv4
+                    else if (qtype == 28)
                     {
-                        byte[] resp = new byte[qEnd];
-                        Buffer.BlockCopy(req, 0, resp, 0, qEnd);
-                        resp[2] = 0x81; resp[3] = 0x80;
-                        resp[6] = 0x00; resp[7] = 0x00;
-                        resp[8] = 0x00; resp[9] = 0x00;
-                        resp[10] = 0x00; resp[11] = 0x00;
-                        udp.SendTo(resp, clientEp);
+                        SendDnsEmptyOrNxDomain(udp, clientEp, req, qEnd, 0);
                         return;
+                    }
+                }
+
+                if (TencentHttpDnsHosts.Contains(qname))
+                {
+                    string mode = GetTencentDnsLanMode();
+                    if (mode == "fastfail" || mode == "nxdomain")
+                    {
+                        SendDnsEmptyOrNxDomain(udp, clientEp, req, qEnd, 3); // NXDOMAIN for instant fallback
+                        Log("[LAN-DNS-QQ-FASTFAIL] " + qname + " -> NXDOMAIN (for " + clientEp.Address + ")");
+                        return;
+                    }
+                    else if (mode != "off")
+                    {
+                        if (qtype == 1)
+                        {
+                            SendDnsARecord(udp, clientEp, req, qEnd, lanIp, qname, "LAN-DNS-QQ-FRAG");
+                            return;
+                        }
+                        else if (qtype == 28)
+                        {
+                            SendDnsEmptyOrNxDomain(udp, clientEp, req, qEnd, 0);
+                            return;
+                        }
                     }
                 }
 
@@ -396,6 +462,9 @@ namespace UURemoteTlsFix
             IPAddress parsed;
             if (IPAddress.TryParse(h, out parsed)) return h;
 
+            if (h == "dns.wechat.com")
+                return "43.152.112.101";
+
             if (h == "api.nrd.nie.163.com" || h == "api-ipv4.nrd.nie.163.com")
             {
                 string ip = QueryDoh223("api.nrd.nie.163.com", null);
@@ -421,7 +490,7 @@ namespace UURemoteTlsFix
                 IPAddress[] addrs = Dns.GetHostAddresses(h);
                 foreach (IPAddress a in addrs)
                 {
-                    if (a.AddressFamily == AddressFamily.InterNetwork && !a.ToString().StartsWith("198.18."))
+                    if (a.AddressFamily == AddressFamily.InterNetwork && !a.ToString().StartsWith("198.18.") && !a.ToString().StartsWith("127."))
                         return a.ToString();
                 }
             }
@@ -435,7 +504,7 @@ namespace UURemoteTlsFix
             {
                 if (len < 43 || buf[0] != 0x16 || buf[1] != 0x03 || buf[5] != 0x01) return null;
                 string ascii = Encoding.ASCII.GetString(buf, 0, len);
-                Match m = Regex.Match(ascii, @"([a-zA-Z0-9_-]+\.)+(?:nrd\.nie\.163\.com|163\.com|netease\.com)");
+                Match m = Regex.Match(ascii, @"([a-zA-Z0-9_-]+\.)+(?:nrd\.nie\.163\.com|163\.com|netease\.com|weixin\.qq\.com\.cn|weixin\.qq\.com|kg\.qq\.com|qq\.com|wechat\.com)");
                 if (m.Success) return m.Value;
             }
             catch { }
@@ -461,8 +530,28 @@ namespace UURemoteTlsFix
             }
 
             string payloadAscii = Encoding.ASCII.GetString(data, 5, recLen);
-            int idx = payloadAscii.IndexOf("nrd.nie.163.com", StringComparison.OrdinalIgnoreCase);
-            if (idx < 0)
+            string[] targetMarkers = new string[]
+            {
+                "nrd.nie.163.com",
+                "dns.weixin.qq.com.cn",
+                "dns.weixin.qq.com",
+                "httpdns.kg.qq.com",
+                "dns.wechat.com",
+                "dns.qq.com"
+            };
+
+            int splitPos = -1;
+            foreach (string marker in targetMarkers)
+            {
+                int idx = payloadAscii.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0)
+                {
+                    splitPos = idx + (marker.Length / 2);
+                    break;
+                }
+            }
+
+            if (splitPos < 0)
             {
                 byte[] copy = new byte[len];
                 Buffer.BlockCopy(data, 0, copy, 0, len);
@@ -471,8 +560,7 @@ namespace UURemoteTlsFix
 
             byte verMajor = data[1];
             byte verMinor = data[2];
-            int splitPos = idx + 5;
-            if (splitPos >= recLen) splitPos = recLen / 2;
+            if (splitPos >= recLen || splitPos <= 0) splitPos = recLen / 2;
 
             int len1 = splitPos;
             int len2 = recLen - splitPos;

@@ -18,38 +18,50 @@ $runKey       = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $uuDataDir    = Join-Path $env:ProgramData "Netease\GameViewer"
 $proxyIniPath = Join-Path $uuDataDir "proxy_config.ini"
 $hostsPath    = Join-Path $env:WINDIR "System32\drivers\etc\hosts"
+$utf8NoBom    = New-Object System.Text.UTF8Encoding($false)
 
 Write-Host "======================================================================" -ForegroundColor Cyan
 Write-Host "         正在卸载 UU 远程校园网 TLS 破阻断服务并恢复默认配置          " -ForegroundColor Cyan
 Write-Host "======================================================================" -ForegroundColor Cyan
 
-# 1. 停止后台进程并移除自启
-Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.Name -match 'python' -and $_.CommandLine -match 'uu_tls_fragmenter'
-} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Remove-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
-if (Test-Path $installDir) {
-    Remove-Item -Path $installDir -Recurse -Force -ErrorAction SilentlyContinue
-}
-Write-Ok "已停止后台分片服务并移除开机自启项与安装目录"
-
-# 2. 恢复 UU 远程原生 proxy_config.ini 为无代理状态
+# 1. 恢复 UU 远程原生 proxy_config.ini 为无代理状态
 if (Test-Path $proxyIniPath) {
     $resetIni = "[Proxy]`nsettingType=0`ntype=0`nhost=`nport=0`nusername=`nbypass=`npassword=`n"
-    [System.IO.File]::WriteAllText($proxyIniPath, $resetIni, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($proxyIniPath, $resetIni, $utf8NoBom)
     Write-Ok "已将 UU 远程 proxy_config.ini 恢复为默认无代理状态 (settingType=0)"
 }
 
-# 3. 清理系统 hosts (若为管理员)
+# 2. 清理系统 hosts 中的 UU 远程条目 (保留可能存在的 QQ/微信条目)
+$qqHostsActive = $false
 if ($isAdmin -and (Test-Path $hostsPath)) {
-    $hLines = Get-Content $hostsPath -ErrorAction SilentlyContinue | Where-Object {
-        $_ -notmatch 'UU_REMOTE_TLS_FIX' -and $_ -notmatch 'nrd\.nie\.163\.com'
+    $allLines = @(Get-Content $hostsPath -ErrorAction SilentlyContinue)
+    foreach ($l in $allLines) {
+        if ($l -match 'QQ_WECHAT_HTTPDNS_FIX' -and $l -match '127\.0\.0\.1') {
+            $qqHostsActive = $true
+        }
     }
-    [System.IO.File]::WriteAllLines($hostsPath, $hLines, (New-Object System.Text.UTF8Encoding($false)))
+    $hLines = @($allLines | Where-Object {
+        $_ -notmatch 'UU_REMOTE_TLS_FIX' -and $_ -notmatch 'nrd\.nie\.163\.com'
+    })
+    [System.IO.File]::WriteAllLines($hostsPath, $hLines, $utf8NoBom)
     & ipconfig.exe /flushdns | Out-Null
-    Write-Ok "已清理系统 hosts 映射条目"
+    Write-Ok "已清理系统 hosts 中的 UU 远程映射条目"
+}
+
+# 3. 停止后台进程并移除自启（若 QQ/微信分片模式仍在使用，则保留守护进程）
+if (-not $qqHostsActive) {
+    Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match 'python' -and $_.CommandLine -match 'uu_tls_fragmenter'
+    } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Remove-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+    if (Test-Path $installDir) {
+        Remove-Item -Path $installDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Ok "已停止后台分片服务并移除开机自启项与安装目录"
+} else {
+    Write-Ok "检测到 QQ/微信 TLS 分片仍在启用中，已保留后台守护服务"
 }
 
 Write-Host "`n======================================================================" -ForegroundColor Cyan
