@@ -46,7 +46,7 @@ function Write-LinesSafely([string]$path, [string[]]$lines, [System.Text.Encodin
     }
 }
 
-function Stop-FragmenterProcesses {
+function Stop-FragmenterProcess {
     Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -match 'python' -and $_.CommandLine -match 'uu_tls_fragmenter'
@@ -118,7 +118,7 @@ if (Test-Path $hostsPath) {
 
 # 3. 停止后台进程、移除自启与防火墙规则（若 QQ/微信分片模式仍在使用，则保留守护进程与规则）
 if (-not $qqHostsActive) {
-    Stop-FragmenterProcesses
+    Stop-FragmenterProcess
     Remove-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -ErrorAction SilentlyContinue
     if ($isAdmin) {
         Remove-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP","UURemoteTlsFix-LAN-UDP" -ErrorAction SilentlyContinue

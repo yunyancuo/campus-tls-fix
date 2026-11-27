@@ -76,7 +76,7 @@ function Write-LinesSafely([string]$path, [string[]]$lines, [System.Text.Encodin
     }
 }
 
-function Stop-FragmenterProcesses {
+function Stop-FragmenterProcess {
     Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
     for ($i = 0; $i -lt 15; $i++) {
         if (-not (Get-Process -Name "UUTlsFragmenter" -ErrorAction SilentlyContinue)) { break }
@@ -146,7 +146,7 @@ if (-not $isAdmin) {
 Write-Step "步骤 1/3: 编译并启动本地双模守护程序 (UUTlsFragmenter.exe)"
 
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-Stop-FragmenterProcesses
+Stop-FragmenterProcess
 
 $csSource = @'
 using System;
@@ -2534,7 +2534,7 @@ foreach ($qd in $qqDomains) {
     $domainModes[$qd] = $effectiveMode
 }
 
-function Sync-QqHostsRules([string[]]$baseLines, [hashtable]$modeMap) {
+function Sync-QqHostsRule([string[]]$baseLines, [hashtable]$modeMap) {
     $outLines = New-Object System.Collections.Generic.List[string]
     foreach ($line in $baseLines) { [void]$outLines.Add($line) }
     foreach ($qd in $qqDomains) {
@@ -2549,7 +2549,7 @@ function Sync-QqHostsRules([string[]]$baseLines, [hashtable]$modeMap) {
     & ipconfig.exe /flushdns | Out-Null
 }
 
-Sync-QqHostsRules -baseLines $baseHosts -modeMap $domainModes
+Sync-QqHostsRule -baseLines $baseHosts -modeMap $domainModes
 if ($effectiveMode -eq "Fragment") {
     Write-Ok "已将 5 个腾讯 HTTPDNS 域名映射至 127.0.0.1:443 (本机透明 TLS 双帧切分放通模式)"
 } else {
@@ -2603,7 +2603,7 @@ foreach ($d in $qqDomains) {
 
 # 若 Auto 模式下存在分片超时域名，真正更新系统 hosts 并刷新 DNS 复测确认生效
 if ($fallbackDomains.Count -gt 0) {
-    Sync-QqHostsRules -baseLines $baseHosts -modeMap $domainModes
+    Sync-QqHostsRule -baseLines $baseHosts -modeMap $domainModes
     if ($fallbackDomains.Count -eq $qqDomains.Count) {
         [System.IO.File]::WriteAllText($modeFile, "fastfail", $utf8NoBom)
         Write-Warn "全部 5 个域名均已切换至 FastFail，并同步更新局域网 DNS 模式为 fastfail"

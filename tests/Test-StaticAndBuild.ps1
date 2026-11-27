@@ -12,6 +12,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { Write-Verbose $_.Exception.Message }
+$RepoRoot = (Resolve-Path -Path $RepoRoot).Path
 
 $script:Passed = 0
 $script:Failed = 0

@@ -45,7 +45,7 @@ function Write-LinesSafely([string]$path, [string[]]$lines, [System.Text.Encodin
     }
 }
 
-function Stop-FragmenterProcesses {
+function Stop-FragmenterProcess {
     Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
     for ($i = 0; $i -lt 15; $i++) {
         if (-not (Get-Process -Name "UUTlsFragmenter" -ErrorAction SilentlyContinue)) { break }
@@ -105,7 +105,7 @@ if (-not $uuActive -and (Test-Path $proxyIniPath)) {
 }
 
 if (-not $uuActive) {
-    Stop-FragmenterProcesses
+    Stop-FragmenterProcess
     Remove-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -ErrorAction SilentlyContinue
     if ($isAdmin) {
         Remove-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP","UURemoteTlsFix-LAN-UDP" -ErrorAction SilentlyContinue

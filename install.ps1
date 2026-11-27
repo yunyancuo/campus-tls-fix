@@ -70,7 +70,7 @@ function Write-LinesSafely([string]$path, [string[]]$lines, [System.Text.Encodin
     }
 }
 
-function Stop-FragmenterProcesses {
+function Stop-FragmenterProcess {
     Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -match 'python' -and $_.CommandLine -match 'uu_tls_fragmenter'
@@ -170,7 +170,7 @@ if ($Uninstall) {
     }
 
     if (-not $qqHostsActive) {
-        Stop-FragmenterProcesses
+        Stop-FragmenterProcess
         Remove-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -ErrorAction SilentlyContinue
         if ($isAdmin) {
             Remove-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP","UURemoteTlsFix-LAN-UDP" -ErrorAction SilentlyContinue
@@ -199,7 +199,7 @@ Write-Host ("当前权限状态: " + ($(if ($isAdmin) { "管理员 (支持完整
 Write-Step "步骤 1/4: 编译并启动零依赖原生 TLS 分片守护程序 (UUTlsFragmenter.exe)"
 
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-Stop-FragmenterProcesses
+Stop-FragmenterProcess
 
 $csSource = @'
 using System;
