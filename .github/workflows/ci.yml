@@ -1,0 +1,46 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'opt/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-windows:
+    name: 编译验证、静态检查与环回自动化测试
+    runs-on: windows-latest
+    steps:
+      - name: 配置 Git 保留仓库原始行尾
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 检查空白符与行尾规范 (git diff --check)
+        shell: pwsh
+        run: git diff --check
+
+      - name: 安装 PSScriptAnalyzer 静态分析模块
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+            Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
+          }
+
+      - name: 运行 Windows PowerShell 5.1 全量测试与原生 csc.exe 零警告编译
+        shell: powershell
+        run: |
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -NoProfile -ExecutionPolicy Bypass `
+            -File ".\tests\Run-AllTests.ps1" -RequireScriptAnalyzer
