@@ -4,7 +4,7 @@
     校园网 QQ / 微信图片加载缓慢 (腾讯 HTTPDNS / DoH SNI 阻断) 一键修复脚本
 .DESCRIPTION
     解决部分校园网出口网关对腾讯自建 HTTPDNS / DoH 域名进行 SNI 阻断丢包，
-    导致客户端每次加载图片都卡在 TCP/TLS 握手状态机等待 timeout 后才回退系统 DNS 的问题。
+    导致客户端每次加载图片都卡在 TCP/TLS 握手状态机等待超时后才回退系统 DNS 的问题。
 
     覆盖域名：
       - dns.qq.com
@@ -13,11 +13,14 @@
       - httpdns.kg.qq.com
       - dns.wechat.com
 
-    支持两种修复模式（通过 -Mode 参数指定，默认 Auto 双模自适应）：
-      1. Fragment (TLS 分片直连放通): 启动本机无窗口守护程序 UUTlsFragmenter.exe (监听 127.0.0.1:443 & 17899)，
-         结合系统 hosts 将上述 5 个域名指向 127.0.0.1，在本地将 TLS ClientHello 的 SNI 切分为 2 个标准 Record 帧直连放通；
-      2. FastFail (0.0.0.0 快速失败秒回退): 将上述 5 个域名在系统 hosts 中指向 0.0.0.0 (及 ::)，
-         使客户端发起 HTTPDNS 连接时 0ms 立即返回失败，不卡 TCP/HTTP 状态机，瞬间回落到系统 DNS 加载图片。
+    支持三种模式参数（通过 -Mode 指定，默认 Auto 双模自适应）：
+      1. Auto (默认): 优先启用 Fragment 分片直连；实测时若单个域名分片仍超时，自动将该域名降级为 FastFail (0.0.0.0 / ::) 并刷新 DNS 复测；
+      2. Fragment (TLS 分片直连放通): 启动本机守护程序 UUTlsFragmenter.exe (监听 443 端口) 并将 5 个域名指向 127.0.0.1；
+      3. FastFail (0.0.0.0 快速失败秒回退): 将 5 个域名指向 0.0.0.0 (及 ::)，客户端 0~1ms 秒退回系统 DNS。
+.EXAMPLE
+    irm https://gh-proxy.com/https://raw.githubusercontent.com/yunyancuo/campus-tls-fix/main/fix-qq-wechat.ps1 | iex
+.EXAMPLE
+    .\fix-qq-wechat.ps1 -Mode FastFail
 #>
 
 param(
@@ -26,15 +29,92 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { Write-Verbose $_.Exception.Message }
 
 function Write-Step([string]$msg) { Write-Host "`n[*] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
 function Write-Warn([string]$msg) { Write-Host "  [!] $msg" -ForegroundColor Yellow }
 function Write-Err([string]$msg)  { Write-Host "  [X] $msg" -ForegroundColor Red }
 
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function Backup-FileBeforeModify([string]$sourcePath, [string]$backupDir, [string]$prefix) {
+    if (-not (Test-Path $sourcePath)) { return }
+    try {
+        if (-not (Test-Path $backupDir)) {
+            New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+        }
+        $origBackup = Join-Path $backupDir "$prefix.orig.bak"
+        if (-not (Test-Path $origBackup)) {
+            Copy-Item -Path $sourcePath -Destination $origBackup -Force -ErrorAction SilentlyContinue
+        }
+        $lastBackup = Join-Path $backupDir "$prefix.last.bak"
+        Copy-Item -Path $sourcePath -Destination $lastBackup -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warn "备份 $prefix 失败（不影响主流程）: $($_.Exception.Message)"
+    }
+}
+
+function Write-LinesSafely([string]$path, [string[]]$lines, [System.Text.Encoding]$encoding) {
+    $wasReadOnly = $false
+    try {
+        if (Test-Path $path) {
+            $item = Get-Item -Path $path -Force
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                $wasReadOnly = $true
+                $item.Attributes = $item.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+            }
+        }
+        [System.IO.File]::WriteAllLines($path, [string[]]$lines, $encoding)
+    } finally {
+        if ($wasReadOnly -and (Test-Path $path)) {
+            try {
+                $item = Get-Item -Path $path -Force
+                $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::ReadOnly
+            } catch {
+                $null = $_
+            }
+        }
+    }
+}
+
+function Stop-FragmenterProcesses {
+    Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 15; $i++) {
+        if (-not (Get-Process -Name "UUTlsFragmenter" -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 200
+    }
+}
+
+function Test-TcpPortReady([string]$targetHost, [int]$port, [int]$timeoutMs = 500) {
+    $tc = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $tc.BeginConnect($targetHost, $port, $null, $null)
+        try {
+            if (-not $iar.AsyncWaitHandle.WaitOne($timeoutMs, $false)) {
+                return $false
+            }
+            $tc.EndConnect($iar)
+            return $tc.Connected
+        } finally {
+            $iar.AsyncWaitHandle.Close()
+        }
+    } catch {
+        return $false
+    } finally {
+        $tc.Dispose()
+    }
+}
+
+function Resolve-CurlExecutable {
+    $sysCurl = Join-Path $env:WINDIR "System32\curl.exe"
+    if (Test-Path $sysCurl) { return $sysCurl }
+    $cmd = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+$isAdmin      = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $installDir   = Join-Path $env:LOCALAPPDATA "UURemoteTlsFix"
+$backupDir    = Join-Path $installDir "backups"
 $exePath      = Join-Path $installDir "UUTlsFragmenter.exe"
 $csPath       = Join-Path $installDir "UUTlsFragmenter.cs"
 $modeFile     = Join-Path $installDir "qq_wechat_mode.txt"
@@ -66,9 +146,7 @@ if (-not $isAdmin) {
 Write-Step "步骤 1/3: 编译并启动本地双模守护程序 (UUTlsFragmenter.exe)"
 
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-
-Stop-Process -Name "UUTlsFragmenter" -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+Stop-FragmenterProcesses
 
 $csSource = @'
 using System;
@@ -87,52 +165,144 @@ using System.Threading.Tasks;
 
 namespace UURemoteTlsFix
 {
-    internal sealed class FragmentedFirstWriteStream : Stream
+    /// <summary>
+    /// 包装底层流并在首次写入 TLS ClientHello 报文时自动执行双帧 Record 切分的装饰流。
+    /// 同时重写同步 Write、APM BeginWrite/EndWrite 与异步 WriteAsync，确保任意 I/O 路径均可稳定生效。
+    /// </summary>
+    public sealed class FragmentedFirstWriteStream : Stream
     {
         private readonly Stream _inner;
-        private bool _firstWrite = true;
+        private readonly bool _leaveInnerStreamOpen;
+        private int _firstWritePending = 1;
 
-        public FragmentedFirstWriteStream(Stream inner) { _inner = inner; }
+        public FragmentedFirstWriteStream(Stream inner)
+            : this(inner, true)
+        {
+        }
+
+        public FragmentedFirstWriteStream(Stream inner, bool leaveInnerStreamOpen)
+        {
+            if (inner == null) throw new ArgumentNullException("inner");
+            _inner = inner;
+            _leaveInnerStreamOpen = leaveInnerStreamOpen;
+        }
+
         public override bool CanRead { get { return _inner.CanRead; } }
         public override bool CanSeek { get { return false; } }
         public override bool CanWrite { get { return _inner.CanWrite; } }
+        public override bool CanTimeout { get { return _inner.CanTimeout; } }
+        public override int ReadTimeout { get { return _inner.ReadTimeout; } set { _inner.ReadTimeout = value; } }
+        public override int WriteTimeout { get { return _inner.WriteTimeout; } set { _inner.WriteTimeout = value; } }
         public override long Length { get { throw new NotSupportedException(); } }
         public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
-        public override void Flush() { _inner.Flush(); }
-        public override int Read(byte[] buffer, int offset, int count) { return _inner.Read(buffer, offset, count); }
-        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
-        public override void SetLength(long value) { throw new NotSupportedException(); }
+
+        public override void Flush()
+        {
+            _inner.Flush();
+        }
+
+        public override Task FlushAsync(CancellationToken cancellationToken)
+        {
+            return _inner.FlushAsync(cancellationToken);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            return _inner.Read(buffer, offset, count);
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            return _inner.ReadAsync(buffer, offset, count, cancellationToken);
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override void SetLength(long value)
+        {
+            throw new NotSupportedException();
+        }
+
+        private byte[] PrepareWriteBuffer(byte[] buffer, int offset, int count, out int outOffset, out int outCount)
+        {
+            if (buffer == null) throw new ArgumentNullException("buffer");
+            if (offset < 0 || count < 0 || offset + count > buffer.Length)
+                throw new ArgumentOutOfRangeException("count");
+
+            if (count > 0 && Interlocked.CompareExchange(ref _firstWritePending, 0, 1) == 1)
+            {
+                byte[] slice = new byte[count];
+                Buffer.BlockCopy(buffer, offset, slice, 0, count);
+                byte[] fragmented = TlsFragmenter.FragmentTlsClientHello(slice, count);
+                outOffset = 0;
+                outCount = fragmented.Length;
+                return fragmented;
+            }
+
+            outOffset = offset;
+            outCount = count;
+            return buffer;
+        }
 
         public override void Write(byte[] buffer, int offset, int count)
         {
-            if (_firstWrite && count > 0)
+            int outOffset;
+            int outCount;
+            byte[] payload = PrepareWriteBuffer(buffer, offset, count, out outOffset, out outCount);
+            _inner.Write(payload, outOffset, outCount);
+        }
+
+        public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+        {
+            int outOffset;
+            int outCount;
+            byte[] payload = PrepareWriteBuffer(buffer, offset, count, out outOffset, out outCount);
+            return _inner.BeginWrite(payload, outOffset, outCount, callback, state);
+        }
+
+        public override void EndWrite(IAsyncResult asyncResult)
+        {
+            _inner.EndWrite(asyncResult);
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            int outOffset;
+            int outCount;
+            byte[] payload = PrepareWriteBuffer(buffer, offset, count, out outOffset, out outCount);
+            return _inner.WriteAsync(payload, outOffset, outCount, cancellationToken);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !_leaveInnerStreamOpen)
             {
-                _firstWrite = false;
-                byte[] slice = new byte[count];
-                Buffer.BlockCopy(buffer, offset, slice, 0, count);
-                byte[] frag = Program.FragmentTlsClientHello(slice, count);
-                _inner.Write(frag, 0, frag.Length);
+                _inner.Dispose();
             }
-            else
-            {
-                _inner.Write(buffer, offset, count);
-            }
+            base.Dispose(disposing);
         }
     }
 
-    internal static class Program
+    /// <summary>
+    /// TLS ClientHello 精确解析、SNI 提取、Record 双帧切分及 HTTP 降级头改写工具类。
+    /// 严格遵循 RFC 5246 / RFC 6066 / RFC 8446 边界检查，杜绝越界与非标误判。
+    /// </summary>
+    public static class TlsFragmenter
     {
-        private static readonly int MainPort = 17899;
-        private static readonly int TransparentTlsPort = 443;
-        private static readonly int DnsPort = 53;
-        private static string BaseDir;
-        private static string LogPath;
-        private static readonly object LogLock = new object();
+        public const int MaxTlsRecordPayload = 16384;
 
-        private static IPAddress _cachedPhysIp = null;
-        private static DateTime _cachedPhysIpTime = DateTime.MinValue;
-        private static readonly ConcurrentDictionary<string, Tuple<string, DateTime>> DnsCache =
-            new ConcurrentDictionary<string, Tuple<string, DateTime>>();
+        private static readonly string[] TargetMarkers = new string[]
+        {
+            "nrd.nie.163.com",
+            "dns.weixin.qq.com.cn",
+            "dns.weixin.qq.com",
+            "httpdns.kg.qq.com",
+            "dns.wechat.com",
+            "dns.qq.com"
+        };
 
         private static readonly HashSet<string> TencentHttpDnsHosts =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -143,6 +313,587 @@ namespace UURemoteTlsFix
                 "httpdns.kg.qq.com",
                 "dns.wechat.com"
             };
+
+        private static readonly Regex FallbackHostHeaderRegex =
+            new Regex(@"(?im)^Host:\s*(123\.58\.184\.232|42\.186\.225\.155)(:\d+)?\r\n", RegexOptions.Compiled);
+
+        /// <summary>
+        /// 判断域名是否属于网易 UU 远程受阻断域名（nrd.nie.163.com 及其子域）。
+        /// </summary>
+        public static bool IsUuTargetHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return false;
+            string normalized = host.Trim().TrimEnd('.').ToLowerInvariant();
+            return normalized == "nrd.nie.163.com" || normalized.EndsWith(".nrd.nie.163.com", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// 判断域名是否属于腾讯/微信 HTTPDNS 目标域名。
+        /// </summary>
+        public static bool IsTencentHttpDnsHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return false;
+            string normalized = host.Trim().TrimEnd('.').ToLowerInvariant();
+            return TencentHttpDnsHosts.Contains(normalized);
+        }
+
+        /// <summary>
+        /// 判断域名是否需要执行 TLS ClientHello SNI 双帧分片。
+        /// </summary>
+        public static bool IsTargetFragmentHost(string host)
+        {
+            return IsUuTargetHost(host) || IsTencentHttpDnsHost(host);
+        }
+
+        /// <summary>
+        /// 校验 5 字节 TLS Record 头部是否为合法的 Handshake (0x16) 记录。
+        /// </summary>
+        public static bool TryReadTlsHandshakeRecordLength(byte[] data, int len, out int recordLength)
+        {
+            recordLength = 0;
+            if (data == null || len < 5 || len > data.Length) return false;
+            if (data[0] != 0x16 || data[1] != 0x03 || data[2] > 0x04) return false;
+            int rlen = (data[3] << 8) | data[4];
+            if (rlen <= 0 || rlen > MaxTlsRecordPayload) return false;
+            recordLength = rlen;
+            return true;
+        }
+
+        /// <summary>
+        /// 按 RFC 6066 严格解析 TLS ClientHello 中的 server_name (SNI) 扩展，
+        /// 同时输出主机名以及主机名在首条 TLS Record 载荷中的精确偏移与长度。
+        /// </summary>
+        public static bool TryParseClientHelloSni(
+            byte[] data,
+            int len,
+            out string sni,
+            out int sniPayloadOffset,
+            out int sniPayloadLength)
+        {
+            sni = null;
+            sniPayloadOffset = -1;
+            sniPayloadLength = 0;
+
+            int recLen;
+            if (!TryReadTlsHandshakeRecordLength(data, len, out recLen)) return false;
+
+            int recEnd = Math.Min(len, 5 + recLen);
+            // Record Header(5) + Handshake Header(4) + ClientVersion(2) + Random(32) = 43 字节
+            if (recEnd < 43) return false;
+            if (data[5] != 0x01) return false; // 必须为 ClientHello
+
+            int handshakeLen = (data[6] << 16) | (data[7] << 8) | data[8];
+            int hsEnd = Math.Min(recEnd, 9 + handshakeLen);
+            if (hsEnd < 43) return false;
+
+            int pos = 43; // 跳过 ClientVersion(2) + Random(32)
+
+            // 1. Session ID
+            if (pos + 1 > hsEnd) return false;
+            int sessionIdLen = data[pos++];
+            if (pos + sessionIdLen > hsEnd) return false;
+            pos += sessionIdLen;
+
+            // 2. Cipher Suites
+            if (pos + 2 > hsEnd) return false;
+            int cipherSuitesLen = (data[pos] << 8) | data[pos + 1];
+            pos += 2;
+            if (cipherSuitesLen < 2 || (cipherSuitesLen & 1) != 0 || pos + cipherSuitesLen > hsEnd) return false;
+            pos += cipherSuitesLen;
+
+            // 3. Compression Methods
+            if (pos + 1 > hsEnd) return false;
+            int compressionLen = data[pos++];
+            if (compressionLen < 1 || pos + compressionLen > hsEnd) return false;
+            pos += compressionLen;
+
+            // 4. Extensions
+            if (pos + 2 > hsEnd) return false;
+            int extensionsLen = (data[pos] << 8) | data[pos + 1];
+            pos += 2;
+            int extEnd = Math.Min(hsEnd, pos + extensionsLen);
+
+            while (pos + 4 <= extEnd)
+            {
+                int extType = (data[pos] << 8) | data[pos + 1];
+                int extLen = (data[pos + 2] << 8) | data[pos + 3];
+                pos += 4;
+                if (pos + extLen > extEnd) return false;
+
+                if (extType == 0x0000) // server_name 扩展
+                {
+                    int sniPos = pos;
+                    int sniLimit = pos + extLen;
+                    if (sniPos + 2 > sniLimit) return false;
+                    int listLen = (data[sniPos] << 8) | data[sniPos + 1];
+                    sniPos += 2;
+                    int listEnd = Math.Min(sniLimit, sniPos + listLen);
+
+                    while (sniPos + 3 <= listEnd)
+                    {
+                        byte nameType = data[sniPos++];
+                        int nameLen = (data[sniPos] << 8) | data[sniPos + 1];
+                        sniPos += 2;
+                        if (sniPos + nameLen > listEnd) return false;
+
+                        if (nameType == 0x00 && nameLen > 0 && nameLen <= 255)
+                        {
+                            if (!IsValidHostNameBytes(data, sniPos, nameLen)) return false;
+                            sni = Encoding.ASCII.GetString(data, sniPos, nameLen).ToLowerInvariant();
+                            sniPayloadOffset = sniPos - 5; // 相对于 Record Payload (data[5]) 的偏移
+                            sniPayloadLength = nameLen;
+                            return true;
+                        }
+                        sniPos += nameLen;
+                    }
+                    return false;
+                }
+
+                pos += extLen;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 从 TLS ClientHello 报文中提取 SNI 主机名；非 TLS 报文或畸形报文安全返回 null。
+        /// </summary>
+        public static string ExtractSniFromClientHello(byte[] buf, int len)
+        {
+            string sni;
+            int offset;
+            int length;
+            if (TryParseClientHelloSni(buf, len, out sni, out offset, out length))
+                return sni;
+            return null;
+        }
+
+        /// <summary>
+        /// 若首个 TLS Record 为命中目标域名的 ClientHello，将其在关键域名标识中间切分为 2 个标准 TLS Record 帧；
+        /// 其余流量（非 TLS、非目标域名、短包、截断包）保持原样安全拷贝透传。
+        /// </summary>
+        public static byte[] FragmentTlsClientHello(byte[] data, int len)
+        {
+            if (data == null || len <= 0) return new byte[0];
+            if (len > data.Length) len = data.Length;
+
+            int recLen;
+            if (!TryReadTlsHandshakeRecordLength(data, len, out recLen))
+                return CopySlice(data, len);
+
+            int totalFirstRec = 5 + recLen;
+            // 至少需要 2 字节载荷才能切分成两个非空 TLS Record
+            if (len < totalFirstRec || recLen < 2 || data[5] != 0x01)
+                return CopySlice(data, len);
+
+            int splitPos = -1;
+
+            // 主路径：严格按 RFC 6066 定位 SNI 扩展偏移，并优先在核心被封锁后缀中间切分
+            string sni;
+            int sniPayloadOffset;
+            int sniPayloadLength;
+            if (TryParseClientHelloSni(data, totalFirstRec, out sni, out sniPayloadOffset, out sniPayloadLength))
+            {
+                if (!IsTargetFragmentHost(sni))
+                    return CopySlice(data, len);
+
+                int markerIdx = -1;
+                int markerLen = 0;
+                for (int i = 0; i < TargetMarkers.Length; i++)
+                {
+                    int idx = sni.IndexOf(TargetMarkers[i], StringComparison.OrdinalIgnoreCase);
+                    if (idx >= 0)
+                    {
+                        markerIdx = idx;
+                        markerLen = TargetMarkers[i].Length;
+                        break;
+                    }
+                }
+
+                if (markerIdx >= 0 && markerLen >= 2)
+                    splitPos = sniPayloadOffset + markerIdx + (markerLen / 2);
+                else
+                    splitPos = sniPayloadOffset + Math.Max(1, sniPayloadLength / 2);
+            }
+            else
+            {
+                // 兜底路径：针对极少数非标准 ClientHello，在首个 Record 载荷字节内安全扫描 ASCII 目标标记
+                for (int i = 0; i < TargetMarkers.Length; i++)
+                {
+                    int relIdx = IndexOfAsciiIgnoreCase(data, 5, recLen, TargetMarkers[i]);
+                    if (relIdx >= 0)
+                    {
+                        splitPos = relIdx + (TargetMarkers[i].Length / 2);
+                        break;
+                    }
+                }
+            }
+
+            if (splitPos < 0)
+                return CopySlice(data, len);
+
+            if (splitPos <= 0 || splitPos >= recLen)
+                splitPos = recLen / 2;
+
+            byte verMajor = data[1];
+            byte verMinor = data[2];
+            int len1 = splitPos;
+            int len2 = recLen - splitPos;
+            int remLen = len - totalFirstRec;
+
+            byte[] outBuf = new byte[5 + len1 + 5 + len2 + remLen];
+
+            // 第 1 个 TLS Record 帧
+            outBuf[0] = 0x16;
+            outBuf[1] = verMajor;
+            outBuf[2] = verMinor;
+            outBuf[3] = (byte)((len1 >> 8) & 0xFF);
+            outBuf[4] = (byte)(len1 & 0xFF);
+            Buffer.BlockCopy(data, 5, outBuf, 5, len1);
+
+            // 第 2 个 TLS Record 帧
+            int off2 = 5 + len1;
+            outBuf[off2] = 0x16;
+            outBuf[off2 + 1] = verMajor;
+            outBuf[off2 + 2] = verMinor;
+            outBuf[off2 + 3] = (byte)((len2 >> 8) & 0xFF);
+            outBuf[off2 + 4] = (byte)(len2 & 0xFF);
+            Buffer.BlockCopy(data, 5 + len1, outBuf, off2 + 5, len2);
+
+            // 完整保留首条 Record 之后可能粘包的后续数据
+            if (remLen > 0)
+                Buffer.BlockCopy(data, totalFirstRec, outBuf, off2 + 5 + len2, remLen);
+
+            return outBuf;
+        }
+
+        /// <summary>
+        /// 仅改写 HTTP 头部区域中的降级 IP Host 头为 api.nrd.nie.163.com，
+        /// 完整无损保留 \r\n\r\n 之后的二进制请求体，避免 UTF-8 编解码损坏非文本 Body。
+        /// </summary>
+        public static byte[] RewriteFallbackHttpHost(byte[] rawRequest)
+        {
+            if (rawRequest == null || rawRequest.Length == 0) return new byte[0];
+
+            int headerEnd = FindHeaderTerminator(rawRequest, rawRequest.Length);
+            int headerLen = headerEnd >= 0 ? headerEnd : rawRequest.Length;
+            int bodyLen = rawRequest.Length - headerLen;
+
+            string headerText = Encoding.GetEncoding("ISO-8859-1").GetString(rawRequest, 0, headerLen);
+            string rewrittenHeader = FallbackHostHeaderRegex.Replace(headerText, "Host: api.nrd.nie.163.com\r\n");
+            byte[] headerBytes = Encoding.GetEncoding("ISO-8859-1").GetBytes(rewrittenHeader);
+
+            if (bodyLen <= 0) return headerBytes;
+
+            byte[] result = new byte[headerBytes.Length + bodyLen];
+            Buffer.BlockCopy(headerBytes, 0, result, 0, headerBytes.Length);
+            Buffer.BlockCopy(rawRequest, headerLen, result, headerBytes.Length, bodyLen);
+            return result;
+        }
+
+        private static int FindHeaderTerminator(byte[] data, int len)
+        {
+            for (int i = 3; i < len; i++)
+            {
+                if (data[i - 3] == (byte)'\r' &&
+                    data[i - 2] == (byte)'\n' &&
+                    data[i - 1] == (byte)'\r' &&
+                    data[i] == (byte)'\n')
+                {
+                    return i + 1;
+                }
+            }
+            return -1;
+        }
+
+        private static bool IsValidHostNameBytes(byte[] data, int offset, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                byte b = data[offset + i];
+                bool valid = (b >= (byte)'a' && b <= (byte)'z') ||
+                             (b >= (byte)'A' && b <= (byte)'Z') ||
+                             (b >= (byte)'0' && b <= (byte)'9') ||
+                             b == (byte)'-' || b == (byte)'.' || b == (byte)'_';
+                if (!valid) return false;
+            }
+            return true;
+        }
+
+        private static int IndexOfAsciiIgnoreCase(byte[] haystack, int start, int count, string needle)
+        {
+            int nLen = needle.Length;
+            if (nLen == 0 || nLen > count) return -1;
+            int limit = start + count - nLen;
+            for (int i = start; i <= limit; i++)
+            {
+                bool matched = true;
+                for (int j = 0; j < nLen; j++)
+                {
+                    byte hb = haystack[i + j];
+                    if (hb >= (byte)'A' && hb <= (byte)'Z') hb = (byte)(hb + 32);
+                    char nc = needle[j];
+                    if (nc >= 'A' && nc <= 'Z') nc = (char)(nc + 32);
+                    if (hb != (byte)nc)
+                    {
+                        matched = false;
+                        break;
+                    }
+                }
+                if (matched) return i - start;
+            }
+            return -1;
+        }
+
+        private static byte[] CopySlice(byte[] data, int len)
+        {
+            byte[] copy = new byte[len];
+            Buffer.BlockCopy(data, 0, copy, 0, len);
+            return copy;
+        }
+    }
+
+    /// <summary>
+    /// RFC 1035 DNS 报文安全解析与响应构造工具类。
+    /// 包含畸形包防护、QR 标志校验、压缩指针防死循环与 Transaction ID 一致性校验。
+    /// </summary>
+    public static class DnsPacketHelper
+    {
+        public const int MaxDnsUdpPacketSize = 4096;
+        private const int MaxDomainLength = 255;
+        private const int MaxCompressionJumps = 16;
+
+        /// <summary>
+        /// 安全解析 DNS 查询报文。
+        /// 拒绝响应包 (QR=1)、空问题段 (QDCOUNT=0)、非法标签长度 (>63)、越界或循环压缩指针。
+        /// </summary>
+        public static bool TryParseQuery(
+            byte[] req,
+            int length,
+            out string qname,
+            out int qtype,
+            out int qclass,
+            out int questionEnd)
+        {
+            qname = null;
+            qtype = 0;
+            qclass = 0;
+            questionEnd = 0;
+
+            if (req == null || length < 12 || length > req.Length) return false;
+
+            // 仅处理标准查询请求 (QR 位必须为 0)，防止 DNS 反射/放大循环
+            if ((req[2] & 0x80) != 0) return false;
+
+            int qdCount = (req[4] << 8) | req[5];
+            if (qdCount < 1) return false;
+
+            int pos = 12;
+            int afterQnamePos = -1;
+            int jumps = 0;
+            StringBuilder sb = new StringBuilder();
+
+            while (true)
+            {
+                if (pos >= length) return false;
+                byte labLen = req[pos];
+
+                if (labLen == 0)
+                {
+                    if (afterQnamePos < 0) afterQnamePos = pos + 1;
+                    break;
+                }
+
+                if ((labLen & 0xC0) == 0xC0)
+                {
+                    if (pos + 1 >= length) return false;
+                    if (++jumps > MaxCompressionJumps) return false;
+                    int ptr = ((labLen & 0x3F) << 8) | req[pos + 1];
+                    if (ptr < 12 || ptr >= length) return false;
+                    if (afterQnamePos < 0) afterQnamePos = pos + 2;
+                    pos = ptr;
+                    continue;
+                }
+
+                // RFC 1035 规定普通标签高两位必须为 00（长度 1..63）
+                if ((labLen & 0xC0) != 0) return false;
+
+                pos++;
+                if (pos + labLen > length) return false;
+
+                if (sb.Length > 0) sb.Append('.');
+                if (sb.Length + labLen > MaxDomainLength) return false;
+
+                for (int i = 0; i < labLen; i++)
+                {
+                    byte b = req[pos + i];
+                    if (b < 0x20 || b > 0x7E) return false;
+                    sb.Append((char)b);
+                }
+                pos += labLen;
+            }
+
+            if (afterQnamePos < 0 || afterQnamePos + 4 > length) return false;
+
+            qtype = (req[afterQnamePos] << 8) | req[afterQnamePos + 1];
+            qclass = (req[afterQnamePos + 2] << 8) | req[afterQnamePos + 3];
+            questionEnd = afterQnamePos + 4;
+            qname = sb.ToString().ToLowerInvariant();
+            return true;
+        }
+
+        /// <summary>
+        /// 构造标准 IPv4 A 记录应答报文（规范化 QDCOUNT=1, ANCOUNT=1, 清空 NS/AR, 继承 RD 标志）。
+        /// </summary>
+        public static byte[] BuildAResponse(byte[] req, int qEnd, IPAddress ipv4, uint ttlSeconds)
+        {
+            if (req == null || qEnd < 12 || qEnd > req.Length)
+                throw new ArgumentOutOfRangeException("qEnd");
+            if (ipv4 == null || ipv4.AddressFamily != AddressFamily.InterNetwork)
+                throw new ArgumentException("IPv4 address is required.", "ipv4");
+
+            byte[] resp = new byte[qEnd + 16];
+            Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+
+            resp[2] = (byte)(0x80 | (req[2] & 0x01)); // QR=1, Opcode=0, AA=0, TC=0, 继承 RD
+            resp[3] = 0x80;                           // RA=1, RCODE=0 (NOERROR)
+            resp[4] = 0x00; resp[5] = 0x01;           // QDCOUNT=1
+            resp[6] = 0x00; resp[7] = 0x01;           // ANCOUNT=1
+            resp[8] = 0x00; resp[9] = 0x00;           // NSCOUNT=0
+            resp[10] = 0x00; resp[11] = 0x00;         // ARCOUNT=0
+
+            int aOff = qEnd;
+            resp[aOff] = 0xC0; resp[aOff + 1] = 0x0C;     // Name pointer -> offset 12
+            resp[aOff + 2] = 0x00; resp[aOff + 3] = 0x01; // Type A
+            resp[aOff + 4] = 0x00; resp[aOff + 5] = 0x01; // Class IN
+            resp[aOff + 6] = (byte)((ttlSeconds >> 24) & 0xFF);
+            resp[aOff + 7] = (byte)((ttlSeconds >> 16) & 0xFF);
+            resp[aOff + 8] = (byte)((ttlSeconds >> 8) & 0xFF);
+            resp[aOff + 9] = (byte)(ttlSeconds & 0xFF);
+            resp[aOff + 10] = 0x00; resp[aOff + 11] = 0x04; // RDLENGTH=4
+
+            byte[] ipBytes = ipv4.GetAddressBytes();
+            Buffer.BlockCopy(ipBytes, 0, resp, aOff + 12, 4);
+            return resp;
+        }
+
+        /// <summary>
+        /// 构造无 Answer 段的 DNS 状态响应（如 NOERROR=0、SERVFAIL=2、NXDOMAIN=3）。
+        /// </summary>
+        public static byte[] BuildStatusResponse(byte[] req, int qEnd, byte rcode)
+        {
+            if (req == null || qEnd < 12 || qEnd > req.Length)
+                throw new ArgumentOutOfRangeException("qEnd");
+
+            byte[] resp = new byte[qEnd];
+            Buffer.BlockCopy(req, 0, resp, 0, qEnd);
+
+            resp[2] = (byte)(0x80 | (req[2] & 0x01)); // QR=1, 继承 RD
+            resp[3] = (byte)(0x80 | (rcode & 0x0F));  // RA=1, RCODE
+            resp[4] = 0x00; resp[5] = 0x01;           // QDCOUNT=1
+            resp[6] = 0x00; resp[7] = 0x00;           // ANCOUNT=0
+            resp[8] = 0x00; resp[9] = 0x00;           // NSCOUNT=0
+            resp[10] = 0x00; resp[11] = 0x00;         // ARCOUNT=0
+            return resp;
+        }
+
+        /// <summary>
+        /// 校验上游 DNS 响应包长度、QR 标志以及 Transaction ID 与原请求是否一致。
+        /// </summary>
+        public static bool IsValidUpstreamResponse(byte[] req, byte[] resp, int respLen)
+        {
+            if (req == null || resp == null || req.Length < 12 || respLen < 12 || respLen > resp.Length)
+                return false;
+            if ((resp[2] & 0x80) == 0) return false;
+            return resp[0] == req[0] && resp[1] == req[1];
+        }
+    }
+
+    /// <summary>
+    /// 服务端运行参数配置（默认参数与原有零参数启动行为 100% 一致，同时支持测试与定制化部署）。
+    /// </summary>
+    public sealed class FragmenterConfig
+    {
+        public IPAddress TcpBindAddress { get; set; }
+        public int MainPort { get; set; }
+        public int TransparentTlsPort { get; set; }
+        public bool EnableLanDns { get; set; }
+        public IPAddress DnsBindAddress { get; set; }
+        public int DnsPort { get; set; }
+        public IPAddress LanDnsAnswerIp { get; set; }
+        public IList<IPEndPoint> UpstreamDnsOverride { get; set; }
+        public Func<string, int, IPEndPoint> TargetResolverOverride { get; set; }
+        public bool BindOutboundToPhysicalNic { get; set; }
+        public string BaseDir { get; set; }
+        public bool EnableFileLogging { get; set; }
+        public int HandshakeReadTimeoutMs { get; set; }
+        public int ConnectTimeoutMs { get; set; }
+        public int HalfCloseGraceTimeoutMs { get; set; }
+        public int DnsUpstreamTimeoutMs { get; set; }
+
+        public FragmenterConfig()
+        {
+            TcpBindAddress = IPAddress.Any;
+            MainPort = 17899;
+            TransparentTlsPort = 443;
+            EnableLanDns = true;
+            DnsBindAddress = null;
+            DnsPort = 53;
+            LanDnsAnswerIp = null;
+            UpstreamDnsOverride = null;
+            TargetResolverOverride = null;
+            BindOutboundToPhysicalNic = true;
+            BaseDir = AppDomain.CurrentDomain.BaseDirectory;
+            EnableFileLogging = true;
+            HandshakeReadTimeoutMs = 10000;
+            ConnectTimeoutMs = 5000;
+            HalfCloseGraceTimeoutMs = 3000;
+            DnsUpstreamTimeoutMs = 1500;
+        }
+    }
+
+    /// <summary>
+    /// 本机无窗口 TLS 分片代理与局域网 DNS 守护引擎。
+    /// 支持 SOCKS5 / HTTP CONNECT / 透明 TLS / HTTP 降级自愈升级 / 局域网 DNS 动态继承与优雅关停。
+    /// </summary>
+    public sealed class FragmenterServer : IDisposable
+    {
+        private const int MaxHttpHeaderBytes = 8192;
+        private const int MaxDnsCacheEntries = 1024;
+        private const int MaxDohResponseBytes = 65536;
+        private const int PumpBufferSize = 16384;
+        private const int NetworkSnapshotTtlSeconds = 30;
+        private const int SioUdpConnReset = -1744830452;
+
+        private sealed class NetworkSnapshot
+        {
+            public readonly IPAddress PhysicalIp;
+            public readonly IList<IPAddress> PhysicalDnsServers;
+            public readonly DateTime CapturedAtUtc;
+
+            public NetworkSnapshot(IPAddress physicalIp, IList<IPAddress> dnsServers, DateTime capturedAtUtc)
+            {
+                PhysicalIp = physicalIp;
+                PhysicalDnsServers = dnsServers;
+                CapturedAtUtc = capturedAtUtc;
+            }
+        }
+
+        private static readonly string[] VirtualAdapterKeywords = new string[]
+        {
+            "wintun", "tun", "tap", "vethernet", "wsl", "hyper-v",
+            "vmware", "virtual", "vbox", "docker", "wireguard", "tailscale",
+            "zerotier", "clash", "mihomo", "sing-box", "hamachi", "radmin", "npcap"
+        };
+
+        private static readonly string[] DohServers = new string[]
+        {
+            "223.5.5.5",
+            "223.6.6.6"
+        };
+
+        private static readonly Regex DohDataIpRegex =
+            new Regex("\"data\"\\s*:\\s*\"((?:\\d{1,3}\\.){3}\\d{1,3})\"", RegexOptions.Compiled);
 
         private static readonly Dictionary<string, string> FallbackHostIps =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -164,311 +915,664 @@ namespace UURemoteTlsFix
                 { "dns.wechat.com", "43.152.112.101" }
             };
 
-        [STAThread]
-        public static void Main(string[] args)
+        private readonly FragmenterConfig _config;
+        private readonly string _logPath;
+        private readonly string _logOldPath;
+        private readonly string _modeFilePath;
+        private readonly object _logLock = new object();
+        private readonly object _modeCacheLock = new object();
+        private readonly ConcurrentDictionary<string, Tuple<string, DateTime>> _dnsCache =
+            new ConcurrentDictionary<string, Tuple<string, DateTime>>(StringComparer.OrdinalIgnoreCase);
+
+        private volatile NetworkSnapshot _netSnapshot;
+        private string _cachedTencentMode = "fragment";
+        private DateTime _cachedTencentModeCheckUtc = DateTime.MinValue;
+        private DateTime _cachedTencentModeWriteUtc = DateTime.MinValue;
+        private int _disposed;
+        private readonly object _dnsSocketLock = new object();
+        private Socket _activeAutoLanDnsSocket;
+        private IPAddress _activeAutoLanDnsIp;
+
+        private NetworkAddressChangedEventHandler _addrChangedHandler;
+        private NetworkAvailabilityChangedEventHandler _availChangedHandler;
+
+        public FragmenterServer(FragmenterConfig config)
         {
-            BaseDir = AppDomain.CurrentDomain.BaseDirectory;
-            LogPath = Path.Combine(BaseDir, "uu_tls_fragmenter.log");
+            if (config == null) throw new ArgumentNullException("config");
+            _config = config;
+            string baseDir = string.IsNullOrEmpty(config.BaseDir)
+                ? AppDomain.CurrentDomain.BaseDirectory
+                : config.BaseDir;
+            _logPath = Path.Combine(baseDir, "uu_tls_fragmenter.log");
+            _logOldPath = Path.Combine(baseDir, "uu_tls_fragmenter.log.old");
+            _modeFilePath = Path.Combine(baseDir, "qq_wechat_mode.txt");
 
-            bool createdNew;
-            using (Mutex mutex = new Mutex(true, @"Local\UURemoteTlsFragmenterNativeMutex", out createdNew))
+            _addrChangedHandler = delegate(object s, EventArgs e) { OnNetworkChanged(); };
+            _availChangedHandler = delegate(object s, NetworkAvailabilityEventArgs e) { OnNetworkChanged(); };
+            NetworkChange.NetworkAddressChanged += _addrChangedHandler;
+            NetworkChange.NetworkAvailabilityChanged += _availChangedHandler;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
-                if (!createdNew) return;
-
-                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)3072;
-                NetworkChange.NetworkAddressChanged += (s, e) => { _cachedPhysIp = null; };
-                NetworkChange.NetworkAvailabilityChanged += (s, e) => { _cachedPhysIp = null; };
-
-                Log("Starting UUTlsFragmenter Service (0.0.0.0:17899, 0.0.0.0:443, LAN DNS :53)");
-
-                Task t1 = StartListenerAsync(IPAddress.Any, MainPort);
-                Task t2 = StartListenerAsync(IPAddress.Any, TransparentTlsPort);
-                Task t3 = StartLanDnsServerAsync();
-
-                Task.WaitAll(t1, t2, t3);
+                try { NetworkChange.NetworkAddressChanged -= _addrChangedHandler; } catch { }
+                try { NetworkChange.NetworkAvailabilityChanged -= _availChangedHandler; } catch { }
             }
         }
 
-        private static void Log(string msg)
+        public void InvalidateNetworkCache()
         {
+            _netSnapshot = null;
+        }
+
+        private void OnNetworkChanged()
+        {
+            InvalidateNetworkCache();
+            if (_config.DnsBindAddress != null) return;
+
+            Socket socketToRestart = null;
+            lock (_dnsSocketLock)
+            {
+                if (_activeAutoLanDnsSocket != null && _activeAutoLanDnsIp != null)
+                {
+                    IPAddress currentPhys = GetPhysicalNetworkSnapshot().PhysicalIp;
+                    if (currentPhys != null && !currentPhys.Equals(_activeAutoLanDnsIp))
+                    {
+                        socketToRestart = _activeAutoLanDnsSocket;
+                    }
+                }
+            }
+            if (socketToRestart != null)
+            {
+                Log("Network change detected; triggering immediate LAN DNS rebind.");
+                try { socketToRestart.Close(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 启动所有已配置的 TCP 代理监听与局域网 UDP DNS 服务，直至 CancellationToken 取消。
+        /// </summary>
+        public Task RunAsync(CancellationToken ct)
+        {
+            List<Task> tasks = new List<Task>();
+            Log(string.Format(
+                "Starting UUTlsFragmenter Service (TCP {0}:{1}, TransparentTLS :{2}, LAN DNS :{3})",
+                _config.TcpBindAddress,
+                _config.MainPort,
+                _config.TransparentTlsPort,
+                _config.EnableLanDns ? _config.DnsPort : 0));
+
+            if (_config.MainPort > 0)
+                tasks.Add(StartTcpListenerAsync(_config.TcpBindAddress, _config.MainPort, ct));
+            if (_config.TransparentTlsPort > 0)
+                tasks.Add(StartTcpListenerAsync(_config.TcpBindAddress, _config.TransparentTlsPort, ct));
+            if (_config.EnableLanDns && _config.DnsPort > 0)
+                tasks.Add(StartLanDnsServerAsync(ct));
+
+            return Task.WhenAll(tasks.ToArray());
+        }
+
+        private void Log(string msg)
+        {
+            if (!_config.EnableFileLogging) return;
             try
             {
                 string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [INFO] " + msg + Environment.NewLine;
-                lock (LogLock)
+                lock (_logLock)
                 {
-                    FileInfo fi = new FileInfo(LogPath);
+                    FileInfo fi = new FileInfo(_logPath);
                     if (fi.Exists && fi.Length > 2 * 1024 * 1024)
-                        File.WriteAllText(LogPath, line, Encoding.UTF8);
+                    {
+                        try
+                        {
+                            if (File.Exists(_logOldPath)) File.Delete(_logOldPath);
+                            File.Move(_logPath, _logOldPath);
+                        }
+                        catch { }
+                        File.WriteAllText(_logPath, line, Encoding.UTF8);
+                    }
                     else
-                        File.AppendAllText(LogPath, line, Encoding.UTF8);
+                    {
+                        File.AppendAllText(_logPath, line, Encoding.UTF8);
+                    }
                 }
             }
             catch { }
         }
 
-        private static string GetTencentDnsLanMode()
+        private void ObserveTask(Task task, string context)
         {
-            try
-            {
-                string modeFile = Path.Combine(BaseDir, "qq_wechat_mode.txt");
-                if (File.Exists(modeFile))
+            if (task == null) return;
+            task.ContinueWith(
+                t =>
                 {
-                    string m = File.ReadAllText(modeFile, Encoding.UTF8).Trim().ToLowerInvariant();
-                    if (m == "fastfail" || m == "nxdomain" || m == "off") return m;
-                }
-            }
-            catch { }
-            return "fragment";
+                    if (t.IsFaulted && t.Exception != null)
+                    {
+                        Exception inner = t.Exception.GetBaseException();
+                        Log("[WARN] Background task fault (" + context + "): " + inner.Message);
+                    }
+                },
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
         }
 
-        private static async Task StartListenerAsync(IPAddress bindAddr, int port)
+        /// <summary>
+        /// 读取 qq_wechat_mode.txt 运行模式（带 1 秒缓存与修改时间检测，支持热切换且降低磁盘 I/O）。
+        /// </summary>
+        public string GetTencentDnsLanMode()
+        {
+            DateTime now = DateTime.UtcNow;
+            lock (_modeCacheLock)
+            {
+                if ((now - _cachedTencentModeCheckUtc).TotalMilliseconds < 1000)
+                    return _cachedTencentMode;
+                _cachedTencentModeCheckUtc = now;
+
+                try
+                {
+                    if (!File.Exists(_modeFilePath))
+                    {
+                        _cachedTencentMode = "fragment";
+                        _cachedTencentModeWriteUtc = DateTime.MinValue;
+                        return _cachedTencentMode;
+                    }
+
+                    DateTime writeUtc = File.GetLastWriteTimeUtc(_modeFilePath);
+                    if (writeUtc != _cachedTencentModeWriteUtc)
+                    {
+                        string m = File.ReadAllText(_modeFilePath, Encoding.UTF8).Trim().ToLowerInvariant();
+                        if (m == "fastfail" || m == "nxdomain" || m == "off")
+                            _cachedTencentMode = m;
+                        else
+                            _cachedTencentMode = "fragment";
+                        _cachedTencentModeWriteUtc = writeUtc;
+                    }
+                }
+                catch
+                {
+                    _cachedTencentMode = "fragment";
+                }
+                return _cachedTencentMode;
+            }
+        }
+
+        private async Task StartTcpListenerAsync(IPAddress bindAddr, int port, CancellationToken ct)
         {
             TcpListener listener = null;
+            CancellationTokenRegistration cancelReg = default(CancellationTokenRegistration);
             try
             {
                 listener = new TcpListener(bindAddr, port);
                 listener.Start(128);
-                Log("Listening TCP on " + bindAddr + ":" + port);
-                while (true)
+                TcpListener localListener = listener;
+                cancelReg = ct.Register(delegate
                 {
-                    TcpClient client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    Task _ = HandleClientAsync(client);
+                    try { localListener.Stop(); } catch { }
+                });
+
+                Log("Listening TCP on " + bindAddr + ":" + port);
+                while (!ct.IsCancellationRequested)
+                {
+                    TcpClient client = null;
+                    bool acceptTransientError = false;
+                    try
+                    {
+                        client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break;
+                    }
+                    catch (SocketException)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        acceptTransientError = true;
+                    }
+
+                    if (acceptTransientError)
+                    {
+                        try { await Task.Delay(50, ct).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { break; }
+                        continue;
+                    }
+
+                    if (client != null)
+                        ObserveTask(HandleClientAsync(client, ct), "HandleClient:" + port);
                 }
+            }
+            catch (OperationCanceledException)
+            {
             }
             catch (Exception ex)
             {
-                Log("Listener on port " + port + " skipped/stopped: " + ex.Message);
+                if (!ct.IsCancellationRequested)
+                    Log("Listener on port " + port + " skipped/stopped: " + ex.Message);
             }
             finally
             {
+                cancelReg.Dispose();
                 if (listener != null) { try { listener.Stop(); } catch { } }
             }
         }
 
-        private static async Task StartLanDnsServerAsync()
+        private async Task StartLanDnsServerAsync(CancellationToken ct)
         {
             await Task.Yield();
-            IPAddress physIp = DetectPhysicalIp();
-            if (physIp == null) return;
+            while (!ct.IsCancellationRequested)
+            {
+                IPAddress bindIp = _config.DnsBindAddress ?? GetPhysicalNetworkSnapshot().PhysicalIp;
+                if (bindIp == null)
+                {
+                    try { await Task.Delay(3000, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                    continue;
+                }
 
-            Socket udp = null;
+                IPAddress answerIp = _config.LanDnsAnswerIp ?? bindIp;
+                Socket udp = null;
+                CancellationTokenRegistration cancelReg = default(CancellationTokenRegistration);
+                bool retryDelayNeeded = false;
+                try
+                {
+                    udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                    udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    try { udp.IOControl(SioUdpConnReset, new byte[] { 0, 0, 0, 0 }, null); } catch { }
+                    udp.Bind(new IPEndPoint(bindIp, _config.DnsPort));
+
+                    if (_config.DnsBindAddress == null)
+                    {
+                        lock (_dnsSocketLock)
+                        {
+                            _activeAutoLanDnsSocket = udp;
+                            _activeAutoLanDnsIp = bindIp;
+                        }
+                    }
+
+                    Socket localUdp = udp;
+                    cancelReg = ct.Register(delegate
+                    {
+                        try { localUdp.Close(); } catch { }
+                    });
+
+                    Log("Listening LAN DNS on " + bindIp + ":" + _config.DnsPort + " (for Router / Wi-Fi devices)");
+
+                    byte[] buf = new byte[DnsPacketHelper.MaxDnsUdpPacketSize];
+                    DateTime lastIpVerifyUtc = DateTime.UtcNow;
+
+                    while (!ct.IsCancellationRequested)
+                    {
+                        // 仅在自动网卡模式下周期校验物理 IP 是否已因 Wi-Fi/以太网切换而变更
+                        if (_config.DnsBindAddress == null && (DateTime.UtcNow - lastIpVerifyUtc).TotalSeconds >= 10)
+                        {
+                            lastIpVerifyUtc = DateTime.UtcNow;
+                            IPAddress currentPhys = GetPhysicalNetworkSnapshot().PhysicalIp;
+                            if (currentPhys != null && !currentPhys.Equals(bindIp))
+                            {
+                                Log("Physical IP changed from " + bindIp + " to " + currentPhys + ", rebinding LAN DNS");
+                                break;
+                            }
+                        }
+
+                        EndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
+                        int n;
+                        try
+                        {
+                            n = await ReceiveFromAsync(udp, buf, remoteEp, ct).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            break;
+                        }
+                        catch (SocketException sex)
+                        {
+                            if (ct.IsCancellationRequested) break;
+                            if (sex.SocketErrorCode == SocketError.ConnectionReset ||
+                                sex.SocketErrorCode == SocketError.MessageSize)
+                            {
+                                continue;
+                            }
+                            Log("LAN DNS socket receive error (" + sex.SocketErrorCode + "), restarting listener");
+                            break;
+                        }
+
+                        if (n < 12) continue;
+
+                        byte[] reqCopy = new byte[n];
+                        Buffer.BlockCopy(buf, 0, reqCopy, 0, n);
+                        IPEndPoint clientEp = remoteEp as IPEndPoint;
+                        if (clientEp == null) continue;
+
+                        Socket udpRef = udp;
+                        IPAddress ansIpRef = answerIp;
+                        IPAddress bindIpRef = bindIp;
+                        ObserveTask(
+                            HandleDnsQueryAsync(udpRef, clientEp, reqCopy, bindIpRef, ansIpRef, ct),
+                            "HandleDnsQuery");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (!ct.IsCancellationRequested)
+                    {
+                        Log("LAN DNS listener skipped/retrying: " + ex.Message);
+                        retryDelayNeeded = true;
+                    }
+                }
+                finally
+                {
+                    cancelReg.Dispose();
+                    if (_config.DnsBindAddress == null)
+                    {
+                        lock (_dnsSocketLock)
+                        {
+                            if (_activeAutoLanDnsSocket == udp)
+                            {
+                                _activeAutoLanDnsSocket = null;
+                                _activeAutoLanDnsIp = null;
+                            }
+                        }
+                    }
+                    if (udp != null) { try { udp.Close(); } catch { } }
+                }
+
+                if (retryDelayNeeded && !ct.IsCancellationRequested)
+                {
+                    try { await Task.Delay(5000, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                }
+            }
+        }
+
+        private static Task<int> ReceiveFromAsync(Socket udp, byte[] buffer, EndPoint remoteEp, CancellationToken ct)
+        {
+            TaskCompletionSource<int> tcs = new TaskCompletionSource<int>();
             try
             {
-                udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                udp.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                try { udp.IOControl(-1744830452, new byte[] { 0, 0, 0, 0 }, null); } catch { }
-                udp.Bind(new IPEndPoint(physIp, DnsPort));
-                Log("Listening LAN DNS on " + physIp + ":" + DnsPort + " (for Router / Wi-Fi devices)");
-
-                byte[] buf = new byte[512];
-                while (true)
-                {
-                    EndPoint remoteEp = new IPEndPoint(IPAddress.Any, 0);
-                    int n = 0;
-                    try
+                EndPoint ep = remoteEp;
+                udp.BeginReceiveFrom(
+                    buffer,
+                    0,
+                    buffer.Length,
+                    SocketFlags.None,
+                    ref ep,
+                    delegate(IAsyncResult ar)
                     {
-                        n = await Task.Run(() => udp.ReceiveFrom(buf, ref remoteEp)).ConfigureAwait(false);
-                    }
-                    catch (SocketException)
-                    {
-                        continue;
-                    }
-                    if (n <= 12) continue;
-
-                    byte[] reqCopy = new byte[n];
-                    Buffer.BlockCopy(buf, 0, reqCopy, 0, n);
-                    IPEndPoint clientEp = (IPEndPoint)remoteEp;
-                    Socket udpRef = udp;
-                    Task _ = Task.Run(() => HandleDnsQuery(udpRef, clientEp, reqCopy, physIp));
-                }
+                        try
+                        {
+                            EndPoint actualEp = ep;
+                            int received = udp.EndReceiveFrom(ar, ref actualEp);
+                            // 回写对端地址信息
+                            IPEndPoint target = remoteEp as IPEndPoint;
+                            IPEndPoint actual = actualEp as IPEndPoint;
+                            if (target != null && actual != null)
+                            {
+                                target.Address = actual.Address;
+                                target.Port = actual.Port;
+                            }
+                            tcs.TrySetResult(received);
+                        }
+                        catch (Exception ex)
+                        {
+                            if (ct.IsCancellationRequested) tcs.TrySetCanceled();
+                            else tcs.TrySetException(ex);
+                        }
+                    },
+                    null);
             }
             catch (Exception ex)
             {
-                Log("LAN DNS listener skipped: " + ex.Message);
+                if (ct.IsCancellationRequested) tcs.TrySetCanceled();
+                else tcs.TrySetException(ex);
             }
-            finally
-            {
-                if (udp != null) { try { udp.Close(); } catch { } }
-            }
+            return tcs.Task;
         }
 
-        private static void SendDnsARecord(Socket udp, IPEndPoint clientEp, byte[] req, int qEnd, IPAddress ip, string qname, string tag)
-        {
-            byte[] resp = new byte[qEnd + 16];
-            Buffer.BlockCopy(req, 0, resp, 0, qEnd);
-            resp[2] = 0x81; resp[3] = 0x80; // Standard query response, no error
-            resp[6] = 0x00; resp[7] = 0x01; // 1 answer
-            resp[8] = 0x00; resp[9] = 0x00;
-            resp[10] = 0x00; resp[11] = 0x00;
-            int aOff = qEnd;
-            resp[aOff] = 0xC0; resp[aOff + 1] = 0x0C; // Name pointer
-            resp[aOff + 2] = 0x00; resp[aOff + 3] = 0x01; // Type A
-            resp[aOff + 4] = 0x00; resp[aOff + 5] = 0x01; // Class IN
-            resp[aOff + 6] = 0x00; resp[aOff + 7] = 0x00; resp[aOff + 8] = 0x00; resp[aOff + 9] = 0x3C; // TTL 60s
-            resp[aOff + 10] = 0x00; resp[aOff + 11] = 0x04; // Data len 4
-            byte[] ipBytes = ip.GetAddressBytes();
-            Buffer.BlockCopy(ipBytes, 0, resp, aOff + 12, 4);
-            udp.SendTo(resp, clientEp);
-            Log("[" + tag + "] " + qname + " -> " + ip + " (for " + clientEp.Address + ")");
-        }
-
-        private static void SendDnsEmptyOrNxDomain(Socket udp, IPEndPoint clientEp, byte[] req, int qEnd, byte rcode)
-        {
-            byte[] resp = new byte[qEnd];
-            Buffer.BlockCopy(req, 0, resp, 0, qEnd);
-            resp[2] = 0x81;
-            resp[3] = (byte)(0x80 | (rcode & 0x0F));
-            resp[6] = 0x00; resp[7] = 0x00;
-            resp[8] = 0x00; resp[9] = 0x00;
-            resp[10] = 0x00; resp[11] = 0x00;
-            udp.SendTo(resp, clientEp);
-        }
-
-        private static void HandleDnsQuery(Socket udp, IPEndPoint clientEp, byte[] req, IPAddress lanIp)
+        private static void SafeUdpSend(Socket udp, byte[] payload, IPEndPoint target)
         {
             try
             {
-                int pos = 12;
-                StringBuilder sb = new StringBuilder();
-                while (pos < req.Length)
-                {
-                    int labLen = req[pos++];
-                    if (labLen == 0) break;
-                    if ((labLen & 0xC0) == 0xC0) { pos++; break; }
-                    if (pos + labLen > req.Length) return;
-                    if (sb.Length > 0) sb.Append('.');
-                    sb.Append(Encoding.ASCII.GetString(req, pos, labLen));
-                    pos += labLen;
-                }
-                if (pos + 4 > req.Length) return;
-                int qtype = (req[pos] << 8) | req[pos + 1];
-                int qEnd = pos + 4;
-                string qname = sb.ToString().ToLowerInvariant();
+                udp.SendTo(payload, target);
+            }
+            catch { }
+        }
 
-                if (qname.EndsWith(".nrd.nie.163.com") || qname == "nrd.nie.163.com")
+        private async Task HandleDnsQueryAsync(
+            Socket udp,
+            IPEndPoint clientEp,
+            byte[] req,
+            IPAddress bindIp,
+            IPAddress answerIp,
+            CancellationToken ct)
+        {
+            try
+            {
+                string qname;
+                int qtype;
+                int qclass;
+                int qEnd;
+                if (!DnsPacketHelper.TryParseQuery(req, req.Length, out qname, out qtype, out qclass, out qEnd))
+                    return;
+
+                if (TlsFragmenter.IsUuTargetHost(qname))
                 {
                     if (qtype == 1)
                     {
-                        SendDnsARecord(udp, clientEp, req, qEnd, lanIp, qname, "LAN-DNS-UU");
+                        byte[] resp = DnsPacketHelper.BuildAResponse(req, qEnd, answerIp, 60);
+                        SafeUdpSend(udp, resp, clientEp);
+                        Log("[LAN-DNS-UU] " + qname + " -> " + answerIp + " (for " + clientEp.Address + ")");
                         return;
                     }
-                    else if (qtype == 28)
+                    if (qtype == 28)
                     {
-                        SendDnsEmptyOrNxDomain(udp, clientEp, req, qEnd, 0);
+                        byte[] resp = DnsPacketHelper.BuildStatusResponse(req, qEnd, 0);
+                        SafeUdpSend(udp, resp, clientEp);
                         return;
                     }
                 }
 
-                if (TencentHttpDnsHosts.Contains(qname))
+                if (TlsFragmenter.IsTencentHttpDnsHost(qname))
                 {
                     string mode = GetTencentDnsLanMode();
                     if (mode == "fastfail" || mode == "nxdomain")
                     {
-                        SendDnsEmptyOrNxDomain(udp, clientEp, req, qEnd, 3); // NXDOMAIN for instant fallback
+                        byte[] resp = DnsPacketHelper.BuildStatusResponse(req, qEnd, 3); // NXDOMAIN
+                        SafeUdpSend(udp, resp, clientEp);
                         Log("[LAN-DNS-QQ-FASTFAIL] " + qname + " -> NXDOMAIN (for " + clientEp.Address + ")");
                         return;
                     }
-                    else if (mode != "off")
+                    if (mode != "off")
                     {
                         if (qtype == 1)
                         {
-                            SendDnsARecord(udp, clientEp, req, qEnd, lanIp, qname, "LAN-DNS-QQ-FRAG");
+                            byte[] resp = DnsPacketHelper.BuildAResponse(req, qEnd, answerIp, 60);
+                            SafeUdpSend(udp, resp, clientEp);
+                            Log("[LAN-DNS-QQ-FRAG] " + qname + " -> " + answerIp + " (for " + clientEp.Address + ")");
                             return;
                         }
-                        else if (qtype == 28)
+                        if (qtype == 28)
                         {
-                            SendDnsEmptyOrNxDomain(udp, clientEp, req, qEnd, 0);
+                            byte[] resp = DnsPacketHelper.BuildStatusResponse(req, qEnd, 0);
+                            SafeUdpSend(udp, resp, clientEp);
                             return;
                         }
                     }
                 }
 
-                // Forward other DNS queries to physical NIC's configured IPv4 DNS servers first (e.g. campus intranet DNS), fallback to 223.5.5.5
-                List<IPAddress> upstreams = GetPhysicalDnsServers(lanIp);
-                foreach (IPAddress upDns in upstreams)
+                // 转发其余域名至上游 DNS（优先物理网卡配置的校园网内网 DNS，失败回退至阿里公共 DNS）
+                IList<IPEndPoint> upstreams = GetUpstreamDnsEndpoints();
+                for (int i = 0; i < upstreams.Count; i++)
                 {
-                    try
+                    if (ct.IsCancellationRequested) return;
+                    byte[] upstreamResp = await ForwardUdpDnsAsync(req, bindIp, upstreams[i], ct).ConfigureAwait(false);
+                    if (upstreamResp != null)
                     {
-                        using (Socket fSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
-                        {
-                            fSock.ReceiveTimeout = 1500;
-                            fSock.SendTimeout = 1500;
-                            fSock.Bind(new IPEndPoint(lanIp, 0));
-                            fSock.SendTo(req, new IPEndPoint(upDns, 53));
-                            byte[] rBuf = new byte[1024];
-                            EndPoint upEp = new IPEndPoint(IPAddress.Any, 0);
-                            int rn = fSock.ReceiveFrom(rBuf, ref upEp);
-                            if (rn > 0)
-                            {
-                                byte[] outB = new byte[rn];
-                                Buffer.BlockCopy(rBuf, 0, outB, 0, rn);
-                                udp.SendTo(outB, clientEp);
-                                return;
-                            }
-                        }
+                        SafeUdpSend(udp, upstreamResp, clientEp);
+                        return;
                     }
-                    catch { }
                 }
+
+                // 全部上游失败时显式返回 SERVFAIL，促使客户端快速切换至备选 DNS
+                byte[] servFail = DnsPacketHelper.BuildStatusResponse(req, qEnd, 2);
+                SafeUdpSend(udp, servFail, clientEp);
             }
             catch { }
         }
 
-        private static List<IPAddress> GetPhysicalDnsServers(IPAddress lanIp)
+        private async Task<byte[]> ForwardUdpDnsAsync(byte[] req, IPAddress bindIp, IPEndPoint upstream, CancellationToken ct)
         {
-            List<IPAddress> list = new List<IPAddress>();
+            Socket fSock = null;
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    IPInterfaceProperties props = ni.GetIPProperties();
-                    bool match = false;
-                    foreach (UnicastIPAddressInformation uni in props.UnicastAddresses)
-                    {
-                        if (uni.Address != null && uni.Address.Equals(lanIp))
-                        {
-                            match = true;
-                            break;
-                        }
-                    }
-                    if (!match) continue;
+                fSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                try { fSock.IOControl(SioUdpConnReset, new byte[] { 0, 0, 0, 0 }, null); } catch { }
 
-                    foreach (IPAddress dns in props.DnsAddresses)
-                    {
-                        if (dns.AddressFamily == AddressFamily.InterNetwork && !dns.Equals(lanIp))
-                        {
-                            string s = dns.ToString();
-                            if (!s.StartsWith("127.") && !s.StartsWith("198.18.") && !list.Contains(dns))
-                                list.Add(dns);
-                        }
-                    }
+                // 仅当目标上游与本机绑定地址均为非回环物理地址时才绑定物理 IP，避免环回测试或本地转发失败
+                if (_config.BindOutboundToPhysicalNic &&
+                    bindIp != null &&
+                    !IPAddress.IsLoopback(bindIp) &&
+                    !IPAddress.IsLoopback(upstream.Address))
+                {
+                    try { fSock.Bind(new IPEndPoint(bindIp, 0)); } catch { }
+                }
+
+                // Connect 锁定对端地址与端口，由内核过滤离路径伪造 UDP 报文
+                fSock.Connect(upstream);
+                fSock.Send(req);
+
+                byte[] rBuf = new byte[DnsPacketHelper.MaxDnsUdpPacketSize];
+                int rn = await ReceiveAsyncWithTimeout(fSock, rBuf, _config.DnsUpstreamTimeoutMs, ct).ConfigureAwait(false);
+                if (DnsPacketHelper.IsValidUpstreamResponse(req, rBuf, rn))
+                {
+                    byte[] outB = new byte[rn];
+                    Buffer.BlockCopy(rBuf, 0, outB, 0, rn);
+                    return outB;
                 }
             }
             catch { }
-
-            IPAddress fallback = IPAddress.Parse("223.5.5.5");
-            if (!list.Contains(fallback)) list.Add(fallback);
-            return list;
+            finally
+            {
+                if (fSock != null) { try { fSock.Close(); } catch { } }
+            }
+            return null;
         }
 
-        private static IPAddress DetectPhysicalIp()
+        private static void SwallowFaultedTask(Task task)
         {
-            if (_cachedPhysIp != null && (DateTime.UtcNow - _cachedPhysIpTime).TotalSeconds < 30)
-                return _cachedPhysIp;
+            if (task == null) return;
+            task.ContinueWith(
+                t =>
+                {
+                    if (t.Exception != null) GC.KeepAlive(t.Exception);
+                },
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+        }
+
+        private static async Task<int> ReceiveAsyncWithTimeout(Socket sock, byte[] buf, int timeoutMs, CancellationToken ct)
+        {
+            TaskCompletionSource<int> tcs = new TaskCompletionSource<int>();
+            try
+            {
+                sock.BeginReceive(
+                    buf,
+                    0,
+                    buf.Length,
+                    SocketFlags.None,
+                    delegate(IAsyncResult ar)
+                    {
+                        try
+                        {
+                            int n = sock.EndReceive(ar);
+                            tcs.TrySetResult(n);
+                        }
+                        catch (Exception ex)
+                        {
+                            tcs.TrySetException(ex);
+                        }
+                    },
+                    null);
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+
+            using (CancellationTokenSource delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                Task delayTask = Task.Delay(timeoutMs, delayCts.Token);
+                Task completed = await Task.WhenAny(tcs.Task, delayTask).ConfigureAwait(false);
+                if (completed != tcs.Task)
+                {
+                    SwallowFaultedTask(tcs.Task);
+                    try { sock.Close(); } catch { }
+                    throw new TimeoutException("UDP DNS upstream receive timeout.");
+                }
+                delayCts.Cancel();
+                return await tcs.Task.ConfigureAwait(false);
+            }
+        }
+
+        private IList<IPEndPoint> GetUpstreamDnsEndpoints()
+        {
+            if (_config.UpstreamDnsOverride != null && _config.UpstreamDnsOverride.Count > 0)
+                return _config.UpstreamDnsOverride;
+
+            NetworkSnapshot snap = GetPhysicalNetworkSnapshot();
+            List<IPEndPoint> result = new List<IPEndPoint>();
+            if (snap != null && snap.PhysicalDnsServers != null)
+            {
+                for (int i = 0; i < snap.PhysicalDnsServers.Count; i++)
+                    result.Add(new IPEndPoint(snap.PhysicalDnsServers[i], 53));
+            }
+            IPAddress fallback1 = IPAddress.Parse("223.5.5.5");
+            IPAddress fallback2 = IPAddress.Parse("223.6.6.6");
+            AddUniqueDnsEndpoint(result, fallback1, 53);
+            AddUniqueDnsEndpoint(result, fallback2, 53);
+            return result;
+        }
+
+        private static void AddUniqueDnsEndpoint(List<IPEndPoint> list, IPAddress ip, int port)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i].Address.Equals(ip) && list[i].Port == port) return;
+            }
+            list.Add(new IPEndPoint(ip, port));
+        }
+
+        /// <summary>
+        /// 获取当前物理网卡 IP 与对应的上游 IPv4 DNS 列表（通过不可变快照原子缓存 30 秒，网卡变更即时失效）。
+        /// </summary>
+        private NetworkSnapshot GetPhysicalNetworkSnapshot()
+        {
+            NetworkSnapshot current = _netSnapshot;
+            if (current != null && (DateTime.UtcNow - current.CapturedAtUtc).TotalSeconds < NetworkSnapshotTtlSeconds)
+                return current;
+
+            IPAddress bestIp = null;
+            List<IPAddress> bestDns = new List<IPAddress>();
+            int bestScore = -1;
 
             try
             {
-                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                NetworkInterface[] interfaces = NetworkInterface.GetAllNetworkInterfaces();
+                for (int i = 0; i < interfaces.Length; i++)
                 {
+                    NetworkInterface ni = interfaces[i];
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
                         ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
 
                     string desc = (ni.Name + " " + ni.Description).ToLowerInvariant();
-                    if (desc.Contains("wintun") || desc.Contains("tun") || desc.Contains("tap") ||
-                        desc.Contains("vethernet") || desc.Contains("wsl") || desc.Contains("hyper-v") ||
-                        desc.Contains("vmware") || desc.Contains("virtual"))
-                        continue;
+                    if (IsVirtualAdapterDescription(desc)) continue;
 
                     IPInterfaceProperties props = ni.GetIPProperties();
                     if (props.GatewayAddresses == null || props.GatewayAddresses.Count == 0) continue;
@@ -476,7 +1580,8 @@ namespace UURemoteTlsFix
                     bool hasIpv4Gw = false;
                     foreach (GatewayIPAddressInformation gw in props.GatewayAddresses)
                     {
-                        if (gw.Address != null && gw.Address.AddressFamily == AddressFamily.InterNetwork &&
+                        if (gw.Address != null &&
+                            gw.Address.AddressFamily == AddressFamily.InterNetwork &&
                             !gw.Address.Equals(IPAddress.Any))
                         {
                             hasIpv4Gw = true;
@@ -485,130 +1590,284 @@ namespace UURemoteTlsFix
                     }
                     if (!hasIpv4Gw) continue;
 
+                    IPAddress candidateIp = null;
                     foreach (UnicastIPAddressInformation uni in props.UnicastAddresses)
                     {
-                        if (uni.Address.AddressFamily == AddressFamily.InterNetwork)
+                        if (uni.Address != null && uni.Address.AddressFamily == AddressFamily.InterNetwork)
                         {
-                            string ipStr = uni.Address.ToString();
-                            if (!ipStr.StartsWith("198.18.") && !ipStr.StartsWith("127.") && !ipStr.StartsWith("169.254."))
+                            if (IsUsablePhysicalIpv4(uni.Address))
                             {
-                                _cachedPhysIp = uni.Address;
-                                _cachedPhysIpTime = DateTime.UtcNow;
-                                return _cachedPhysIp;
+                                candidateIp = uni.Address;
+                                break;
                             }
                         }
+                    }
+                    if (candidateIp == null) continue;
+
+                    List<IPAddress> candidateDns = new List<IPAddress>();
+                    foreach (IPAddress dns in props.DnsAddresses)
+                    {
+                        if (dns != null &&
+                            dns.AddressFamily == AddressFamily.InterNetwork &&
+                            !dns.Equals(candidateIp) &&
+                            IsUsableUpstreamDnsIpv4(dns) &&
+                            !candidateDns.Contains(dns))
+                        {
+                            candidateDns.Add(dns);
+                        }
+                    }
+
+                    int score = 10;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+                        ni.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet)
+                        score += 20;
+                    else if (ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                        score += 15;
+                    if (candidateDns.Count > 0) score += 5;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestIp = candidateIp;
+                        bestDns = candidateDns;
                     }
                 }
             }
             catch { }
-            return _cachedPhysIp;
+
+            NetworkSnapshot refreshed = new NetworkSnapshot(bestIp, bestDns, DateTime.UtcNow);
+            _netSnapshot = refreshed;
+            return refreshed;
         }
 
-        private static Socket CreateBoundSocket(string targetIp, int targetPort)
+        private static bool IsVirtualAdapterDescription(string lowerDesc)
         {
-            for (int attempt = 0; attempt < 2; attempt++)
+            for (int i = 0; i < VirtualAdapterKeywords.Length; i++)
             {
-                IPAddress physIp = DetectPhysicalIp();
-                Socket sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                if (lowerDesc.IndexOf(VirtualAdapterKeywords[i], StringComparison.Ordinal) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool IsUsablePhysicalIpv4(IPAddress ip)
+        {
+            byte[] b = ip.GetAddressBytes();
+            if (b.Length != 4) return false;
+            if (b[0] == 127 || b[0] == 0) return false;
+            if (b[0] == 169 && b[1] == 254) return false;
+            if (b[0] == 198 && b[1] == 18) return false; // 代理软件常见 FakeIP 网段
+            return true;
+        }
+
+        private static bool IsUsableUpstreamDnsIpv4(IPAddress ip)
+        {
+            byte[] b = ip.GetAddressBytes();
+            if (b.Length != 4) return false;
+            if (b[0] == 127 || b[0] == 0) return false;
+            if (b[0] == 169 && b[1] == 254) return false;
+            if (b[0] == 198 && b[1] == 18) return false;
+            return true;
+        }
+
+        private async Task<Socket> CreateBoundSocketAsync(IPAddress targetIp, int targetPort, CancellationToken ct)
+        {
+            if (targetIp == null) throw new ArgumentNullException("targetIp");
+
+            bool shouldBindPhys = _config.BindOutboundToPhysicalNic && !IPAddress.IsLoopback(targetIp);
+            int maxAttempts = shouldBindPhys ? 2 : 1;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                Socket sock = new Socket(targetIp.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
                 sock.NoDelay = true;
                 sock.ReceiveTimeout = 8000;
                 sock.SendTimeout = 8000;
-                if (physIp != null)
+
+                if (shouldBindPhys)
                 {
-                    try { sock.Bind(new IPEndPoint(physIp, 0)); } catch { _cachedPhysIp = null; }
+                    IPAddress physIp = GetPhysicalNetworkSnapshot().PhysicalIp;
+                    if (physIp != null && physIp.AddressFamily == targetIp.AddressFamily)
+                    {
+                        try { sock.Bind(new IPEndPoint(physIp, 0)); }
+                        catch { InvalidateNetworkCache(); }
+                    }
                 }
 
                 try
                 {
-                    IAsyncResult res = sock.BeginConnect(IPAddress.Parse(targetIp), targetPort, null, null);
-                    if (!res.AsyncWaitHandle.WaitOne(5000, true))
-                    {
-                        sock.Close();
-                        throw new TimeoutException("Connect timeout to " + targetIp + ":" + targetPort);
-                    }
-                    sock.EndConnect(res);
+                    await ConnectSocketWithTimeoutAsync(sock, new IPEndPoint(targetIp, targetPort), _config.ConnectTimeoutMs, ct)
+                        .ConfigureAwait(false);
                     return sock;
                 }
                 catch
                 {
-                    sock.Close();
-                    _cachedPhysIp = null;
-                    if (attempt == 1) throw;
+                    try { sock.Close(); } catch { }
+                    if (shouldBindPhys) InvalidateNetworkCache();
+                    if (attempt == maxAttempts - 1) throw;
                 }
             }
+
             throw new TimeoutException("Connect failed to " + targetIp + ":" + targetPort);
         }
 
-        private static string QueryDoh223(string domain, string ecs)
+        private static async Task ConnectSocketWithTimeoutAsync(Socket sock, IPEndPoint ep, int timeoutMs, CancellationToken ct)
+        {
+            TaskCompletionSource<bool> tcs = new TaskCompletionSource<bool>();
+            try
+            {
+                sock.BeginConnect(
+                    ep,
+                    delegate(IAsyncResult ar)
+                    {
+                        try
+                        {
+                            sock.EndConnect(ar);
+                            tcs.TrySetResult(true);
+                        }
+                        catch (Exception ex)
+                        {
+                            tcs.TrySetException(ex);
+                        }
+                    },
+                    null);
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+
+            using (CancellationTokenSource delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                Task delayTask = Task.Delay(timeoutMs, delayCts.Token);
+                Task completed = await Task.WhenAny(tcs.Task, delayTask).ConfigureAwait(false);
+                if (completed != tcs.Task)
+                {
+                    SwallowFaultedTask(tcs.Task);
+                    try { sock.Close(); } catch { }
+                    ct.ThrowIfCancellationRequested();
+                    throw new TimeoutException("Connect timeout to " + ep);
+                }
+                delayCts.Cancel();
+                await tcs.Task.ConfigureAwait(false);
+            }
+        }
+
+        private async Task<string> QueryDohAliDnsAsync(string domain, string ecs, CancellationToken ct)
         {
             string key = domain + "|" + (ecs ?? "");
             Tuple<string, DateTime> cached;
-            if (DnsCache.TryGetValue(key, out cached) && DateTime.UtcNow < cached.Item2)
+            if (_dnsCache.TryGetValue(key, out cached) && DateTime.UtcNow < cached.Item2)
                 return cached.Item1;
 
             string path = "/resolve?name=" + Uri.EscapeDataString(domain) + "&type=A";
             if (!string.IsNullOrEmpty(ecs))
                 path += "&edns_client_subnet=" + Uri.EscapeDataString(ecs);
 
-            try
+            for (int i = 0; i < DohServers.Length; i++)
             {
-                using (Socket sock = CreateBoundSocket("223.5.5.5", 443))
-                using (NetworkStream ns = new NetworkStream(sock, false))
-                using (SslStream ssl = new SslStream(ns, false, (s, c, ch, e) => true))
+                string dohIp = DohServers[i];
+                try
                 {
-                    ssl.AuthenticateAsClient("223.5.5.5", null, SslProtocols.Tls12, false);
-                    string req = "GET " + path + " HTTP/1.1\r\nHost: 223.5.5.5\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
-                    byte[] reqBytes = Encoding.ASCII.GetBytes(req);
-                    ssl.Write(reqBytes, 0, reqBytes.Length);
-                    using (StreamReader sr = new StreamReader(ssl, Encoding.UTF8))
+                    using (Socket sock = await CreateBoundSocketAsync(IPAddress.Parse(dohIp), 443, ct).ConfigureAwait(false))
+                    using (NetworkStream ns = new NetworkStream(sock, false))
+                    // 注：部分老旧校园网 Windows 10 环境缺少根证书链更新，IP 直连阿里公共 DoH 时宽容校验证书以保障可用性
+                    using (SslStream ssl = new SslStream(ns, false, (s, c, ch, e) => c != null))
                     {
-                        string resp = sr.ReadToEnd();
+                        await Task.Run(delegate
+                        {
+                            ssl.AuthenticateAsClient(dohIp, null, SslProtocols.Tls12, false);
+                        }, ct).ConfigureAwait(false);
+
+                        string req = "GET " + path + " HTTP/1.1\r\nHost: " + dohIp +
+                                     "\r\nAccept: application/json\r\nConnection: close\r\n\r\n";
+                        byte[] reqBytes = Encoding.ASCII.GetBytes(req);
+                        await ssl.WriteAsync(reqBytes, 0, reqBytes.Length, ct).ConfigureAwait(false);
+                        await ssl.FlushAsync(ct).ConfigureAwait(false);
+
+                        string resp = await ReadHttpTextLimitedAsync(ssl, MaxDohResponseBytes, _config.HandshakeReadTimeoutMs, ct)
+                            .ConfigureAwait(false);
+                        if (string.IsNullOrEmpty(resp)) continue;
+
+                        int firstLineEnd = resp.IndexOf("\r\n", StringComparison.Ordinal);
+                        string statusLine = firstLineEnd > 0 ? resp.Substring(0, firstLineEnd) : resp;
+                        if (statusLine.IndexOf(" 200 ", StringComparison.Ordinal) < 0) continue;
+
                         int bodyIdx = resp.IndexOf("\r\n\r\n", StringComparison.Ordinal);
                         string body = bodyIdx >= 0 ? resp.Substring(bodyIdx + 4) : resp;
-                        MatchCollection matches = Regex.Matches(body, "\"data\"\\s*:\\s*\"((?:\\d{1,3}\\.){3}\\d{1,3})\"");
+                        MatchCollection matches = DohDataIpRegex.Matches(body);
                         foreach (Match m in matches)
                         {
-                            string ip = m.Groups[1].Value;
-                            if (!string.IsNullOrEmpty(ip) && !ip.StartsWith("198.18."))
+                            string ipStr = m.Groups[1].Value;
+                            IPAddress candidate;
+                            if (IPAddress.TryParse(ipStr, out candidate) &&
+                                candidate.AddressFamily == AddressFamily.InterNetwork &&
+                                IsUsablePhysicalIpv4(candidate))
                             {
-                                DnsCache[key] = Tuple.Create(ip, DateTime.UtcNow.AddMinutes(5));
-                                return ip;
+                                CacheDnsResult(key, candidate.ToString());
+                                return candidate.ToString();
                             }
                         }
                     }
                 }
+                catch { }
             }
-            catch { }
+
             return null;
         }
 
-        private static string ResolveOptimalTargetIp(string host)
+        private void CacheDnsResult(string key, string ip)
         {
-            string h = (host ?? "").Trim().ToLowerInvariant();
+            if (_dnsCache.Count >= MaxDnsCacheEntries)
+            {
+                DateTime now = DateTime.UtcNow;
+                foreach (KeyValuePair<string, Tuple<string, DateTime>> kv in _dnsCache)
+                {
+                    if (kv.Value.Item2 <= now)
+                    {
+                        Tuple<string, DateTime> removed;
+                        _dnsCache.TryRemove(kv.Key, out removed);
+                    }
+                }
+                if (_dnsCache.Count >= MaxDnsCacheEntries)
+                    _dnsCache.Clear();
+            }
+            _dnsCache[key] = Tuple.Create(ip, DateTime.UtcNow.AddMinutes(5));
+        }
+
+        /// <summary>
+        /// 为已知受阻断 IP 或域名解析最优直连目标 IPv4；无法解析的未知域名安全返回 null（绝不错误导流）。
+        /// </summary>
+        public async Task<string> ResolveOptimalTargetIpAsync(string host, CancellationToken ct)
+        {
+            string h = (host ?? "").Trim().TrimEnd('.').ToLowerInvariant();
+            if (string.IsNullOrEmpty(h)) return null;
+
+            // 将已知不支持 TLS 多帧重组或易被限速的官方节点映射至实测稳定的官方节点
             if (h == "123.58.163.37" || h == "123.58.184.232" || h == "42.186.225.155") return "112.13.123.98";
             if (h == "223.252.194.149") return "34.95.122.33";
 
             IPAddress parsed;
-            if (IPAddress.TryParse(h, out parsed)) return h;
+            if (IPAddress.TryParse(h, out parsed)) return parsed.ToString();
 
             if (h == "dns.wechat.com")
                 return "43.152.112.101";
 
             if (h == "api.nrd.nie.163.com" || h == "api-ipv4.nrd.nie.163.com")
             {
-                string ip = QueryDoh223("api.nrd.nie.163.com", null);
+                string ip = await QueryDohAliDnsAsync("api.nrd.nie.163.com", null, ct).ConfigureAwait(false);
                 if (!string.IsNullOrEmpty(ip) && ip != "123.58.163.37") return ip;
                 return "112.13.123.98";
             }
 
-            if (h.StartsWith("sig-") && h.EndsWith(".nrd.nie.163.com"))
+            if (h.StartsWith("sig-", StringComparison.Ordinal) && h.EndsWith(".nrd.nie.163.com", StringComparison.Ordinal))
             {
-                string ip = QueryDoh223(h, "8.8.8.0/24");
+                string ip = await QueryDohAliDnsAsync(h, "8.8.8.0/24", ct).ConfigureAwait(false);
                 if (!string.IsNullOrEmpty(ip) && ip != "223.252.194.149") return ip;
                 return "34.95.122.33";
             }
 
-            string dohIp = QueryDoh223(h, null);
+            string dohIp = await QueryDohAliDnsAsync(h, null, ct).ConfigureAwait(false);
             if (!string.IsNullOrEmpty(dohIp)) return dohIp;
 
             string fb;
@@ -616,296 +1875,580 @@ namespace UURemoteTlsFix
 
             try
             {
-                IPAddress[] addrs = Dns.GetHostAddresses(h);
-                foreach (IPAddress a in addrs)
+                IPAddress[] addrs = await Dns.GetHostAddressesAsync(h).ConfigureAwait(false);
+                for (int i = 0; i < addrs.Length; i++)
                 {
-                    if (a.AddressFamily == AddressFamily.InterNetwork && !a.ToString().StartsWith("198.18.") && !a.ToString().StartsWith("127."))
+                    IPAddress a = addrs[i];
+                    if (a.AddressFamily == AddressFamily.InterNetwork && IsUsablePhysicalIpv4(a))
                         return a.ToString();
                 }
             }
             catch { }
-            return "112.13.123.98";
-        }
 
-        private static string ExtractSniFromClientHello(byte[] buf, int len)
-        {
-            try
-            {
-                if (len < 43 || buf[0] != 0x16 || buf[1] != 0x03 || buf[5] != 0x01) return null;
-                string ascii = Encoding.ASCII.GetString(buf, 0, len);
-                Match m = Regex.Match(ascii, @"([a-zA-Z0-9_-]+\.)+(?:nrd\.nie\.163\.com|163\.com|netease\.com|weixin\.qq\.com\.cn|weixin\.qq\.com|kg\.qq\.com|qq\.com|wechat\.com)");
-                if (m.Success) return m.Value;
-            }
-            catch { }
             return null;
         }
 
-        internal static byte[] FragmentTlsClientHello(byte[] data, int len)
+        private static async Task<int> ReadWithTimeoutAsync(
+            Stream stream,
+            byte[] buffer,
+            int offset,
+            int count,
+            int timeoutMs,
+            CancellationToken ct)
         {
-            if (len < 6 || data[0] != 0x16 || data[1] != 0x03)
+            using (CancellationTokenSource delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                byte[] copy = new byte[len];
-                Buffer.BlockCopy(data, 0, copy, 0, len);
-                return copy;
-            }
-
-            int recLen = (data[3] << 8) | data[4];
-            int totalFirstRec = 5 + recLen;
-            if (len < totalFirstRec || recLen <= 0 || data[5] != 0x01)
-            {
-                byte[] copy = new byte[len];
-                Buffer.BlockCopy(data, 0, copy, 0, len);
-                return copy;
-            }
-
-            string payloadAscii = Encoding.ASCII.GetString(data, 5, recLen);
-            string[] targetMarkers = new string[]
-            {
-                "nrd.nie.163.com",
-                "dns.weixin.qq.com.cn",
-                "dns.weixin.qq.com",
-                "httpdns.kg.qq.com",
-                "dns.wechat.com",
-                "dns.qq.com"
-            };
-
-            int splitPos = -1;
-            foreach (string marker in targetMarkers)
-            {
-                int idx = payloadAscii.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0)
+                Task<int> readTask = stream.ReadAsync(buffer, offset, count, ct);
+                Task delayTask = Task.Delay(timeoutMs, delayCts.Token);
+                Task completed = await Task.WhenAny(readTask, delayTask).ConfigureAwait(false);
+                if (completed != readTask)
                 {
-                    splitPos = idx + (marker.Length / 2);
-                    break;
+                    SwallowFaultedTask(readTask);
+                    ct.ThrowIfCancellationRequested();
+                    throw new TimeoutException("Stream read timeout.");
                 }
+                delayCts.Cancel();
+                return await readTask.ConfigureAwait(false);
             }
-
-            if (splitPos < 0)
-            {
-                byte[] copy = new byte[len];
-                Buffer.BlockCopy(data, 0, copy, 0, len);
-                return copy;
-            }
-
-            byte verMajor = data[1];
-            byte verMinor = data[2];
-            if (splitPos >= recLen || splitPos <= 0) splitPos = recLen / 2;
-
-            int len1 = splitPos;
-            int len2 = recLen - splitPos;
-            int remLen = len - totalFirstRec;
-
-            byte[] outBuf = new byte[5 + len1 + 5 + len2 + remLen];
-            outBuf[0] = 0x16;
-            outBuf[1] = verMajor;
-            outBuf[2] = verMinor;
-            outBuf[3] = (byte)((len1 >> 8) & 0xFF);
-            outBuf[4] = (byte)(len1 & 0xFF);
-            Buffer.BlockCopy(data, 5, outBuf, 5, len1);
-
-            int off2 = 5 + len1;
-            outBuf[off2] = 0x16;
-            outBuf[off2 + 1] = verMajor;
-            outBuf[off2 + 2] = verMinor;
-            outBuf[off2 + 3] = (byte)((len2 >> 8) & 0xFF);
-            outBuf[off2 + 4] = (byte)(len2 & 0xFF);
-            Buffer.BlockCopy(data, 5 + len1, outBuf, off2 + 5, len2);
-
-            if (remLen > 0)
-                Buffer.BlockCopy(data, totalFirstRec, outBuf, off2 + 5 + len2, remLen);
-
-            return outBuf;
         }
 
-        private static async Task ReadExactAsync(Stream s, byte[] buf, int count)
-        {
-            await ReadExactAsync(s, buf, 0, count).ConfigureAwait(false);
-        }
-
-        private static async Task ReadExactAsync(Stream s, byte[] buf, int offset, int count)
+        private static async Task ReadExactWithTimeoutAsync(
+            Stream stream,
+            byte[] buf,
+            int offset,
+            int count,
+            int timeoutMs,
+            CancellationToken ct)
         {
             int read = 0;
             while (read < count)
             {
-                int n = await s.ReadAsync(buf, offset + read, count - read).ConfigureAwait(false);
+                int n = await ReadWithTimeoutAsync(stream, buf, offset + read, count - read, timeoutMs, ct)
+                    .ConfigureAwait(false);
                 if (n <= 0) throw new EndOfStreamException();
                 read += n;
             }
         }
 
-        private static async Task HandleClientAsync(TcpClient client)
+        private static async Task<string> ReadHttpTextLimitedAsync(Stream stream, int maxBytes, int timeoutMs, CancellationToken ct)
+        {
+            using (MemoryStream ms = new MemoryStream())
+            {
+                byte[] buf = new byte[4096];
+                while (ms.Length < maxBytes)
+                {
+                    int toRead = (int)Math.Min(buf.Length, maxBytes - ms.Length);
+                    int n = await ReadWithTimeoutAsync(stream, buf, 0, toRead, timeoutMs, ct).ConfigureAwait(false);
+                    if (n <= 0) break;
+                    ms.Write(buf, 0, n);
+                }
+                return Encoding.UTF8.GetString(ms.ToArray());
+            }
+        }
+
+        private async Task<byte[]> ReadHttpRequestHeadersAsync(Stream stream, byte firstByte, CancellationToken ct)
+        {
+            byte[] headerBuf = new byte[MaxHttpHeaderBytes];
+            int len = 0;
+            headerBuf[len++] = firstByte;
+            byte[] one = new byte[1];
+
+            while (len < MaxHttpHeaderBytes)
+            {
+                int r = await ReadWithTimeoutAsync(stream, one, 0, 1, _config.HandshakeReadTimeoutMs, ct)
+                    .ConfigureAwait(false);
+                if (r <= 0) return null;
+
+                headerBuf[len++] = one[0];
+                if (len >= 4 &&
+                    headerBuf[len - 4] == (byte)'\r' &&
+                    headerBuf[len - 3] == (byte)'\n' &&
+                    headerBuf[len - 2] == (byte)'\r' &&
+                    headerBuf[len - 1] == (byte)'\n')
+                {
+                    byte[] result = new byte[len];
+                    Buffer.BlockCopy(headerBuf, 0, result, 0, len);
+                    return result;
+                }
+            }
+
+            // HTTP 请求头超出安全上限（防 Slowloris / OOM 攻击）
+            return null;
+        }
+
+        /// <summary>
+        /// 读取客户端首个应用层报文；若检测到 TLS Handshake 记录被 TCP 拆包，
+        /// 自动带超时补齐完整的首个 TLS Record，确保 SNI 分片不会因拆包而静默失效。
+        /// </summary>
+        private async Task<byte[]> ReadInitialPayloadWithTlsCoalesceAsync(Stream cStream, CancellationToken ct)
+        {
+            byte[] buf = new byte[16384];
+            int n = await ReadWithTimeoutAsync(cStream, buf, 0, buf.Length, _config.HandshakeReadTimeoutMs, ct)
+                .ConfigureAwait(false);
+            if (n <= 0) return null;
+
+            // 若首字节为 0x16 (TLS Handshake)，确保拿到完整 Record Header 与 Record Body
+            if (buf[0] == 0x16)
+            {
+                if (n < 5)
+                {
+                    await ReadExactWithTimeoutAsync(cStream, buf, n, 5 - n, _config.HandshakeReadTimeoutMs, ct)
+                        .ConfigureAwait(false);
+                    n = 5;
+                }
+
+                int recLen;
+                if (TlsFragmenter.TryReadTlsHandshakeRecordLength(buf, n, out recLen))
+                {
+                    int totalNeeded = 5 + recLen;
+                    if (n < totalNeeded)
+                    {
+                        byte[] fullRec = new byte[totalNeeded];
+                        Buffer.BlockCopy(buf, 0, fullRec, 0, n);
+                        await ReadExactWithTimeoutAsync(
+                            cStream,
+                            fullRec,
+                            n,
+                            totalNeeded - n,
+                            _config.HandshakeReadTimeoutMs,
+                            ct).ConfigureAwait(false);
+                        return fullRec;
+                    }
+                }
+            }
+
+            byte[] initial = new byte[n];
+            Buffer.BlockCopy(buf, 0, initial, 0, n);
+            return initial;
+        }
+
+        private static bool TryParseHostPort(string authority, out string host, out int port)
+        {
+            host = null;
+            port = 0;
+            if (string.IsNullOrEmpty(authority)) return false;
+
+            string trimmed = authority.Trim();
+            if (trimmed.StartsWith("[", StringComparison.Ordinal))
+            {
+                int closeIdx = trimmed.IndexOf(']');
+                if (closeIdx <= 1) return false;
+                host = trimmed.Substring(1, closeIdx - 1);
+                if (closeIdx + 1 < trimmed.Length && trimmed[closeIdx + 1] == ':')
+                {
+                    int parsedPort;
+                    if (!int.TryParse(trimmed.Substring(closeIdx + 2), out parsedPort)) return false;
+                    if (parsedPort < 1 || parsedPort > 65535) return false;
+                    port = parsedPort;
+                    return true;
+                }
+                port = 443;
+                return true;
+            }
+
+            int colon = trimmed.LastIndexOf(':');
+            if (colon > 0)
+            {
+                host = trimmed.Substring(0, colon);
+                int parsedPort;
+                if (!int.TryParse(trimmed.Substring(colon + 1), out parsedPort)) return false;
+                if (parsedPort < 1 || parsedPort > 65535) return false;
+                port = parsedPort;
+                return !string.IsNullOrEmpty(host);
+            }
+
+            host = trimmed;
+            port = 443;
+            return !string.IsNullOrEmpty(host);
+        }
+
+        private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
         {
             Socket remoteSock = null;
             try
             {
-                client.NoDelay = true;
-                NetworkStream cStream = client.GetStream();
-                byte[] firstBuf = new byte[1];
-                int n0 = await cStream.ReadAsync(firstBuf, 0, 1).ConfigureAwait(false);
-                if (n0 <= 0) return;
-
-                byte b0 = firstBuf[0];
-                string targetHost = "";
-                int targetPort = 443;
-                byte[] initialClientData = null;
-
-                if (b0 == 0x05)
+                using (client)
                 {
-                    byte[] nm = new byte[1];
-                    await ReadExactAsync(cStream, nm, 1).ConfigureAwait(false);
-                    byte[] methods = new byte[nm[0]];
-                    await ReadExactAsync(cStream, methods, nm[0]).ConfigureAwait(false);
-                    await cStream.WriteAsync(new byte[] { 0x05, 0x00 }, 0, 2).ConfigureAwait(false);
-
-                    byte[] hdr = new byte[4];
-                    await ReadExactAsync(cStream, hdr, 4).ConfigureAwait(false);
-                    byte atyp = hdr[3];
-                    if (atyp == 1)
+                    client.NoDelay = true;
+                    using (NetworkStream cStream = client.GetStream())
                     {
-                        byte[] ipb = new byte[4];
-                        await ReadExactAsync(cStream, ipb, 4).ConfigureAwait(false);
-                        targetHost = new IPAddress(ipb).ToString();
-                    }
-                    else if (atyp == 3)
-                    {
-                        byte[] dlen = new byte[1];
-                        await ReadExactAsync(cStream, dlen, 1).ConfigureAwait(false);
-                        byte[] db = new byte[dlen[0]];
-                        await ReadExactAsync(cStream, db, dlen[0]).ConfigureAwait(false);
-                        targetHost = Encoding.ASCII.GetString(db);
-                    }
-                    else return;
+                        byte[] firstBuf = new byte[1];
+                        int n0 = await ReadWithTimeoutAsync(cStream, firstBuf, 0, 1, _config.HandshakeReadTimeoutMs, ct)
+                            .ConfigureAwait(false);
+                        if (n0 <= 0) return;
 
-                    byte[] pb = new byte[2];
-                    await ReadExactAsync(cStream, pb, 2).ConfigureAwait(false);
-                    targetPort = (pb[0] << 8) | pb[1];
+                        byte b0 = firstBuf[0];
+                        string targetHost = "";
+                        int targetPort = 443;
+                        byte[] initialClientData = null;
 
-                    byte[] reply = new byte[] { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
-                    await cStream.WriteAsync(reply, 0, reply.Length).ConfigureAwait(false);
+                        if (b0 == 0x05)
+                        {
+                            // ---------------- SOCKS5 协议握手 ----------------
+                            byte[] nm = new byte[1];
+                            await ReadExactWithTimeoutAsync(cStream, nm, 0, 1, _config.HandshakeReadTimeoutMs, ct)
+                                .ConfigureAwait(false);
+                            if (nm[0] == 0) return;
+
+                            byte[] methods = new byte[nm[0]];
+                            await ReadExactWithTimeoutAsync(cStream, methods, 0, nm[0], _config.HandshakeReadTimeoutMs, ct)
+                                .ConfigureAwait(false);
+
+                            bool supportsNoAuth = false;
+                            for (int i = 0; i < methods.Length; i++)
+                            {
+                                if (methods[i] == 0x00) { supportsNoAuth = true; break; }
+                            }
+                            if (!supportsNoAuth)
+                            {
+                                await cStream.WriteAsync(new byte[] { 0x05, 0xFF }, 0, 2, ct).ConfigureAwait(false);
+                                return;
+                            }
+                            await cStream.WriteAsync(new byte[] { 0x05, 0x00 }, 0, 2, ct).ConfigureAwait(false);
+
+                            byte[] hdr = new byte[4];
+                            await ReadExactWithTimeoutAsync(cStream, hdr, 0, 4, _config.HandshakeReadTimeoutMs, ct)
+                                .ConfigureAwait(false);
+                            if (hdr[0] != 0x05) return;
+                            if (hdr[1] != 0x01) // 仅支持 CONNECT 命令
+                            {
+                                byte[] cmdErr = new byte[] { 0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+                                await cStream.WriteAsync(cmdErr, 0, cmdErr.Length, ct).ConfigureAwait(false);
+                                return;
+                            }
+
+                            byte atyp = hdr[3];
+                            if (atyp == 0x01)
+                            {
+                                byte[] ipb = new byte[4];
+                                await ReadExactWithTimeoutAsync(cStream, ipb, 0, 4, _config.HandshakeReadTimeoutMs, ct)
+                                    .ConfigureAwait(false);
+                                targetHost = new IPAddress(ipb).ToString();
+                            }
+                            else if (atyp == 0x03)
+                            {
+                                byte[] dlen = new byte[1];
+                                await ReadExactWithTimeoutAsync(cStream, dlen, 0, 1, _config.HandshakeReadTimeoutMs, ct)
+                                    .ConfigureAwait(false);
+                                if (dlen[0] == 0) return;
+                                byte[] db = new byte[dlen[0]];
+                                await ReadExactWithTimeoutAsync(cStream, db, 0, dlen[0], _config.HandshakeReadTimeoutMs, ct)
+                                    .ConfigureAwait(false);
+                                targetHost = Encoding.ASCII.GetString(db);
+                            }
+                            else
+                            {
+                                byte[] atypErr = new byte[] { 0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+                                await cStream.WriteAsync(atypErr, 0, atypErr.Length, ct).ConfigureAwait(false);
+                                return;
+                            }
+
+                            byte[] pb = new byte[2];
+                            await ReadExactWithTimeoutAsync(cStream, pb, 0, 2, _config.HandshakeReadTimeoutMs, ct)
+                                .ConfigureAwait(false);
+                            targetPort = (pb[0] << 8) | pb[1];
+                            if (targetPort < 1 || targetPort > 65535) return;
+
+                            // 提前回应成功以便读取客户端 TLS ClientHello 提取精确 SNI 后再优选目标节点
+                            byte[] reply = new byte[] { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+                            await cStream.WriteAsync(reply, 0, reply.Length, ct).ConfigureAwait(false);
+                        }
+                        else if (b0 == 0x16)
+                        {
+                            // ---------------- 透明 TLS (:443) 协议 ----------------
+                            byte[] hdr4 = new byte[4];
+                            await ReadExactWithTimeoutAsync(cStream, hdr4, 0, 4, _config.HandshakeReadTimeoutMs, ct)
+                                .ConfigureAwait(false);
+
+                            byte[] hdr5 = new byte[] { b0, hdr4[0], hdr4[1], hdr4[2], hdr4[3] };
+                            int recLen;
+                            if (!TlsFragmenter.TryReadTlsHandshakeRecordLength(hdr5, 5, out recLen))
+                                return;
+
+                            initialClientData = new byte[5 + recLen];
+                            Buffer.BlockCopy(hdr5, 0, initialClientData, 0, 5);
+                            await ReadExactWithTimeoutAsync(cStream, initialClientData, 5, recLen, _config.HandshakeReadTimeoutMs, ct)
+                                .ConfigureAwait(false);
+
+                            string sni = TlsFragmenter.ExtractSniFromClientHello(initialClientData, initialClientData.Length);
+                            targetHost = !string.IsNullOrEmpty(sni) ? sni : "api.nrd.nie.163.com";
+                            targetPort = 443;
+                        }
+                        else
+                        {
+                            // ---------------- HTTP CONNECT 代理协议 ----------------
+                            byte[] headerBytes = await ReadHttpRequestHeadersAsync(cStream, b0, ct).ConfigureAwait(false);
+                            if (headerBytes == null) return;
+
+                            string reqStr = Encoding.ASCII.GetString(headerBytes);
+                            int lineEnd = reqStr.IndexOf("\r\n", StringComparison.Ordinal);
+                            string firstLine = lineEnd >= 0 ? reqStr.Substring(0, lineEnd) : reqStr;
+                            string[] parts = firstLine.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            if (parts.Length < 2)
+                            {
+                                byte[] badReq = Encoding.ASCII.GetBytes("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+                                await cStream.WriteAsync(badReq, 0, badReq.Length, ct).ConfigureAwait(false);
+                                return;
+                            }
+
+                            if (!string.Equals(parts[0], "CONNECT", StringComparison.OrdinalIgnoreCase))
+                            {
+                                byte[] notAllowed = Encoding.ASCII.GetBytes("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
+                                await cStream.WriteAsync(notAllowed, 0, notAllowed.Length, ct).ConfigureAwait(false);
+                                return;
+                            }
+
+                            if (!TryParseHostPort(parts[1], out targetHost, out targetPort))
+                            {
+                                byte[] badReq = Encoding.ASCII.GetBytes("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+                                await cStream.WriteAsync(badReq, 0, badReq.Length, ct).ConfigureAwait(false);
+                                return;
+                            }
+
+                            byte[] okResp = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
+                            await cStream.WriteAsync(okResp, 0, okResp.Length, ct).ConfigureAwait(false);
+                        }
+
+                        if (initialClientData == null)
+                        {
+                            initialClientData = await ReadInitialPayloadWithTlsCoalesceAsync(cStream, ct).ConfigureAwait(false);
+                            if (initialClientData == null || initialClientData.Length == 0) return;
+
+                            string sni = TlsFragmenter.ExtractSniFromClientHello(initialClientData, initialClientData.Length);
+                            IPAddress dummyIp;
+                            if (!string.IsNullOrEmpty(sni) &&
+                                IPAddress.TryParse(targetHost, out dummyIp) &&
+                                !IPAddress.IsLoopback(dummyIp))
+                            {
+                                targetHost = sni;
+                            }
+                        }
+
+                        bool isFallbackHttp = (targetPort == 80) &&
+                            (string.Equals(targetHost, "123.58.184.232", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(targetHost, "42.186.225.155", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(targetHost, "api.nrd.nie.163.com", StringComparison.OrdinalIgnoreCase));
+                        int connectPort = isFallbackHttp ? 443 : targetPort;
+
+                        IPEndPoint remoteEp = null;
+                        if (_config.TargetResolverOverride != null)
+                        {
+                            remoteEp = _config.TargetResolverOverride(targetHost, connectPort);
+                        }
+
+                        if (remoteEp == null)
+                        {
+                            string targetIpStr = await ResolveOptimalTargetIpAsync(targetHost, ct).ConfigureAwait(false);
+                            IPAddress targetIp;
+                            if (string.IsNullOrEmpty(targetIpStr) || !IPAddress.TryParse(targetIpStr, out targetIp))
+                            {
+                                Log("[WARN] Failed to resolve target host: " + targetHost);
+                                return;
+                            }
+                            remoteEp = new IPEndPoint(targetIp, connectPort);
+                        }
+
+                        remoteSock = await CreateBoundSocketAsync(remoteEp.Address, remoteEp.Port, ct).ConfigureAwait(false);
+                        using (NetworkStream rStream = new NetworkStream(remoteSock, false))
+                        {
+                            Log(string.Format(
+                                "[DIRECT+TLS-FRAG] {0}:{1} -> {2}:{3}",
+                                targetHost,
+                                targetPort,
+                                remoteEp.Address,
+                                remoteEp.Port));
+
+                            if (isFallbackHttp)
+                            {
+                                using (FragmentedFirstWriteStream fragStream = new FragmentedFirstWriteStream(rStream, true))
+                                using (SslStream ssl = new SslStream(fragStream, false, (s, c, ch, e) => c != null))
+                                {
+                                    await Task.Run(delegate
+                                    {
+                                        ssl.AuthenticateAsClient("api.nrd.nie.163.com", null, SslProtocols.Tls12, false);
+                                    }, ct).ConfigureAwait(false);
+
+                                    byte[] rewritten = TlsFragmenter.RewriteFallbackHttpHost(initialClientData);
+                                    await ssl.WriteAsync(rewritten, 0, rewritten.Length, ct).ConfigureAwait(false);
+                                    await ssl.FlushAsync(ct).ConfigureAwait(false);
+
+                                    await RelayBidirectionalAsync(cStream, client.Client, ssl, remoteSock, ct)
+                                        .ConfigureAwait(false);
+                                }
+                                return;
+                            }
+
+                            byte[] firstOut = TlsFragmenter.FragmentTlsClientHello(initialClientData, initialClientData.Length);
+                            await rStream.WriteAsync(firstOut, 0, firstOut.Length, ct).ConfigureAwait(false);
+                            await rStream.FlushAsync(ct).ConfigureAwait(false);
+
+                            await RelayBidirectionalAsync(cStream, client.Client, rStream, remoteSock, ct)
+                                .ConfigureAwait(false);
+                        }
+                    }
                 }
-                else if (b0 == 0x16)
-                {
-                    byte[] hdr4 = new byte[4];
-                    await ReadExactAsync(cStream, hdr4, 4).ConfigureAwait(false);
-                    int recLen = (hdr4[2] << 8) | hdr4[3];
-                    initialClientData = new byte[5 + recLen];
-                    initialClientData[0] = b0;
-                    Buffer.BlockCopy(hdr4, 0, initialClientData, 1, 4);
-                    await ReadExactAsync(cStream, initialClientData, 5, recLen).ConfigureAwait(false);
-
-                    string sni = ExtractSniFromClientHello(initialClientData, initialClientData.Length);
-                    targetHost = !string.IsNullOrEmpty(sni) ? sni : "api.nrd.nie.163.com";
-                    targetPort = 443;
-                }
-                else
-                {
-                    MemoryStream ms = new MemoryStream();
-                    ms.WriteByte(b0);
-                    byte[] b1 = new byte[1];
-                    while (true)
-                    {
-                        int r = await cStream.ReadAsync(b1, 0, 1).ConfigureAwait(false);
-                        if (r <= 0) break;
-                        ms.WriteByte(b1[0]);
-                        byte[] arr = ms.ToArray();
-                        int l = arr.Length;
-                        if (l >= 4 && arr[l - 4] == '\r' && arr[l - 3] == '\n' && arr[l - 2] == '\r' && arr[l - 1] == '\n')
-                            break;
-                    }
-                    string reqStr = Encoding.ASCII.GetString(ms.ToArray());
-                    string firstLine = reqStr.Split('\r', '\n')[0];
-                    string[] parts = firstLine.Split(' ');
-                    if (parts.Length < 2) return;
-                    string hp = parts[1];
-                    int colon = hp.LastIndexOf(':');
-                    if (colon > 0)
-                    {
-                        targetHost = hp.Substring(0, colon);
-                        int.TryParse(hp.Substring(colon + 1), out targetPort);
-                    }
-                    else
-                    {
-                        targetHost = hp;
-                        targetPort = 443;
-                    }
-                    byte[] okResp = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
-                    await cStream.WriteAsync(okResp, 0, okResp.Length).ConfigureAwait(false);
-                }
-
-                if (initialClientData == null)
-                {
-                    byte[] buf = new byte[16384];
-                    int n = await cStream.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false);
-                    if (n <= 0) return;
-                    initialClientData = new byte[n];
-                    Buffer.BlockCopy(buf, 0, initialClientData, 0, n);
-
-                    string sni = ExtractSniFromClientHello(initialClientData, n);
-                    IPAddress dummy;
-                    if (!string.IsNullOrEmpty(sni) && IPAddress.TryParse(targetHost, out dummy))
-                        targetHost = sni;
-                }
-
-                bool isFallbackHttp = (targetPort == 80) &&
-                    (targetHost == "123.58.184.232" || targetHost == "42.186.225.155" || targetHost == "api.nrd.nie.163.com");
-                int connectPort = isFallbackHttp ? 443 : targetPort;
-
-                string targetIp = await Task.Run(() => ResolveOptimalTargetIp(targetHost)).ConfigureAwait(false);
-                remoteSock = await Task.Run(() => CreateBoundSocket(targetIp, connectPort)).ConfigureAwait(false);
-                NetworkStream rStream = new NetworkStream(remoteSock, false);
-
-                Log(string.Format("[DIRECT+TLS-FRAG] {0}:{1} -> {2}:{3}", targetHost, targetPort, targetIp, connectPort));
-
-                if (isFallbackHttp)
-                {
-                    using (FragmentedFirstWriteStream fragStream = new FragmentedFirstWriteStream(rStream))
-                    using (SslStream ssl = new SslStream(fragStream, false, (s, c, ch, e) => true))
-                    {
-                        await Task.Run(() => ssl.AuthenticateAsClient("api.nrd.nie.163.com", null, SslProtocols.Tls12, false)).ConfigureAwait(false);
-                        string plainReq = Encoding.UTF8.GetString(initialClientData);
-                        plainReq = Regex.Replace(plainReq, @"(?im)^Host:\s*(123\.58\.184\.232|42\.186\.225\.155)(:\d+)?\r\n", "Host: api.nrd.nie.163.com\r\n");
-                        byte[] rewritten = Encoding.UTF8.GetBytes(plainReq);
-                        await ssl.WriteAsync(rewritten, 0, rewritten.Length).ConfigureAwait(false);
-
-                        Task c2s = PumpAsync(cStream, ssl);
-                        Task s2c = PumpAsync(ssl, cStream);
-                        await Task.WhenAny(c2s, s2c).ConfigureAwait(false);
-                    }
-                    return;
-                }
-
-                byte[] firstOut = FragmentTlsClientHello(initialClientData, initialClientData.Length);
-                await rStream.WriteAsync(firstOut, 0, firstOut.Length).ConfigureAwait(false);
-
-                Task tUp = PumpAsync(cStream, rStream);
-                Task tDown = PumpAsync(rStream, cStream);
-                await Task.WhenAny(tUp, tDown).ConfigureAwait(false);
             }
-            catch { }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (SocketException) { }
+            catch (TimeoutException) { }
+            catch (ObjectDisposedException) { }
+            catch (Exception ex)
+            {
+                Log("[WARN] Unexpected client handler error: " + ex.Message);
+            }
             finally
             {
-                try { client.Close(); } catch { }
                 if (remoteSock != null) { try { remoteSock.Close(); } catch { } }
             }
         }
 
-        private static async Task PumpAsync(Stream input, Stream output)
+        /// <summary>
+        /// 支持标准 TCP 半关闭（Half-Close）的双向数据转发：
+        /// 当一侧正常读到 EOF 时仅关闭对端写方向，等待另一侧在宽限期内将剩余响应完整送达，避免响应被提前腰斩；
+        /// 若发生连接异常则立即联动终止双向转发。
+        /// </summary>
+        private async Task RelayBidirectionalAsync(
+            Stream clientStream,
+            Socket clientSock,
+            Stream remoteStream,
+            Socket remoteSock,
+            CancellationToken ct)
         {
-            byte[] buf = new byte[16384];
-            try
+            using (CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                while (true)
+                Task<bool> upTask = PumpOneWayAsync(clientStream, remoteStream, remoteSock, linkedCts);
+                Task<bool> downTask = PumpOneWayAsync(remoteStream, clientStream, clientSock, linkedCts);
+
+                Task<bool> first = await Task.WhenAny(upTask, downTask).ConfigureAwait(false);
+                Task<bool> second = (first == upTask) ? downTask : upTask;
+
+                bool cleanEof = false;
+                try { cleanEof = await first.ConfigureAwait(false); }
+                catch { cleanEof = false; }
+
+                if (!cleanEof)
                 {
-                    int n = await input.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false);
-                    if (n <= 0) break;
-                    await output.WriteAsync(buf, 0, n).ConfigureAwait(false);
+                    linkedCts.Cancel();
+                    SafeAbortSocket(clientSock);
+                    SafeAbortSocket(remoteSock);
+                    return;
+                }
+
+                // 正常半关闭场景：等待另一方向把尾部响应数据完全写完，但设定宽限上限防止对端僵尸挂起
+                using (CancellationTokenSource graceCts = CancellationTokenSource.CreateLinkedTokenSource(linkedCts.Token))
+                {
+                    Task graceDelay = Task.Delay(_config.HalfCloseGraceTimeoutMs, graceCts.Token);
+                    Task completedSecond = await Task.WhenAny(second, graceDelay).ConfigureAwait(false);
+                    if (completedSecond != second)
+                    {
+                        linkedCts.Cancel();
+                        SafeAbortSocket(clientSock);
+                        SafeAbortSocket(remoteSock);
+                    }
+                    else
+                    {
+                        graceCts.Cancel();
+                        try { await second.ConfigureAwait(false); } catch { }
+                    }
                 }
             }
+        }
+
+        private static async Task<bool> PumpOneWayAsync(
+            Stream input,
+            Stream output,
+            Socket outputSocket,
+            CancellationTokenSource cts)
+        {
+            byte[] buf = new byte[PumpBufferSize];
+            try
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    int n = await input.ReadAsync(buf, 0, buf.Length, cts.Token).ConfigureAwait(false);
+                    if (n <= 0)
+                    {
+                        try { await output.FlushAsync(cts.Token).ConfigureAwait(false); } catch { }
+                        SafeShutdownSend(outputSocket);
+                        return true;
+                    }
+                    await output.WriteAsync(buf, 0, n, cts.Token).ConfigureAwait(false);
+                }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void SafeShutdownSend(Socket sock)
+        {
+            if (sock == null) return;
+            try
+            {
+                if (sock.Connected)
+                    sock.Shutdown(SocketShutdown.Send);
+            }
             catch { }
+        }
+
+        private static void SafeAbortSocket(Socket sock)
+        {
+            if (sock == null) return;
+            try { sock.Shutdown(SocketShutdown.Both); } catch { }
+            try { sock.Close(); } catch { }
+        }
+    }
+
+    internal static class Program
+    {
+        [STAThread]
+        public static void Main(string[] args)
+        {
+            bool createdNew;
+            using (Mutex mutex = new Mutex(true, @"Local\UURemoteTlsFragmenterNativeMutex", out createdNew))
+            {
+                if (!createdNew) return;
+
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)3072;
+
+                using (CancellationTokenSource cts = new CancellationTokenSource())
+                using (FragmenterServer server = new FragmenterServer(new FragmenterConfig()))
+                {
+                    AppDomain.CurrentDomain.ProcessExit += delegate { try { cts.Cancel(); } catch { } };
+                    try
+                    {
+                        Console.CancelKeyPress += delegate(object s, ConsoleCancelEventArgs e)
+                        {
+                            e.Cancel = true;
+                            try { cts.Cancel(); } catch { }
+                        };
+                    }
+                    catch { }
+
+                    try
+                    {
+                        server.RunAsync(cts.Token).GetAwaiter().GetResult();
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                }
+            }
         }
     }
 }
 '@
+
+# 若从本地仓库/完整解压包运行，优先读取同目录 src\UUTlsFragmenter.cs；在线 irm|iex 时自动使用内嵌源码
+if (-not [string]::IsNullOrEmpty($PSScriptRoot)) {
+    $localSrcPath = Join-Path $PSScriptRoot "src\UUTlsFragmenter.cs"
+    if (Test-Path $localSrcPath) {
+        $csSource = [System.IO.File]::ReadAllText($localSrcPath, [System.Text.Encoding]::UTF8)
+    }
+}
 
 [System.IO.File]::WriteAllText($csPath, $csSource, $utf8NoBom)
 
@@ -913,9 +2456,18 @@ $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $csc)) {
     $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe"
 }
-& $csc /nologo /optimize+ /target:winexe /out:"$exePath" "$csPath" | Out-Null
-if (-not (Test-Path $exePath)) {
-    throw "编译 UUTlsFragmenter.exe 失败。"
+if (-not (Test-Path $csc)) {
+    throw "未找到系统内置 .NET Framework 4.x 编译器 (csc.exe)，无法编译原生守护程序。"
+}
+
+if (Test-Path $exePath) {
+    Remove-Item -Path $exePath -Force
+}
+
+$cscOutput = & $csc /nologo /optimize+ /target:winexe /out:"$exePath" "$csPath" 2>&1
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exePath)) {
+    $detail = ($cscOutput | Out-String).Trim()
+    throw "编译 UUTlsFragmenter.exe 失败 (ExitCode=$LASTEXITCODE):`n$detail"
 }
 Write-Ok "已编译生成原生双模守护服务: $exePath"
 
@@ -933,23 +2485,22 @@ if ($effectiveMode -eq "FastFail") {
 Start-Process -FilePath $exePath -WorkingDirectory $installDir -WindowStyle Hidden
 
 $port443Ready = $false
-for ($i = 0; $i -lt 15; $i++) {
-    Start-Sleep -Milliseconds 200
-    $tc = New-Object System.Net.Sockets.TcpClient
-    try {
-        $tc.Connect("127.0.0.1", 443)
-        if ($tc.Connected) {
+if ($effectiveMode -eq "Fragment") {
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 200
+        if (Test-TcpPortReady -targetHost "127.0.0.1" -port 443 -timeoutMs 400) {
             $port443Ready = $true
-            $tc.Close()
             break
         }
-    } catch {} finally {
-        $tc.Dispose()
     }
 }
 
 if ($effectiveMode -eq "Fragment" -and -not $port443Ready) {
-    Write-Warn "检测到本机 443 端口未就绪或被占用，自动切换至 FastFail (0.0.0.0 秒回退系统 DNS) 模式"
+    if ($Mode -eq "Fragment") {
+        Write-Warn "检测到本机 443 端口未就绪或被其他程序占用（如 IIS / nginx / 代理软件），无法启用 Fragment 模式，自动切换至 FastFail 模式"
+    } else {
+        Write-Warn "检测到本机 443 端口未就绪或被占用，自动切换至 FastFail (0.0.0.0 秒回退系统 DNS) 模式"
+    }
     $effectiveMode = "FastFail"
     [System.IO.File]::WriteAllText($modeFile, "fastfail", $utf8NoBom)
 } else {
@@ -957,15 +2508,13 @@ if ($effectiveMode -eq "Fragment" -and -not $port443Ready) {
 }
 
 Set-ItemProperty -Path $runKey -Name "UURemoteTLSFragmenter" -Value "`"$exePath`""
-if ($isAdmin) {
-    Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
-        $_.DisplayName -match 'uutlsfragmenter|UURemoteTlsFix' -and $_.Action -eq 'Block'
-    } | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-    Remove-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP","UURemoteTlsFix-LAN-UDP" -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP" -Direction Inbound -Action Allow -Program $exePath -Protocol TCP -LocalPort 443,17899 -Profile Any -ErrorAction SilentlyContinue | Out-Null
-    New-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-UDP" -Direction Inbound -Action Allow -Program $exePath -Protocol UDP -LocalPort 53 -Profile Any -ErrorAction SilentlyContinue | Out-Null
-    Write-Ok "已配置 Windows 防火墙局域网放行规则 (UDP :53 / TCP :443, :17899)"
-}
+Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
+    $_.DisplayName -match 'uutlsfragmenter|UURemoteTlsFix' -and $_.Action -eq 'Block'
+} | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP","UURemoteTlsFix-LAN-UDP" -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-TCP" -Direction Inbound -Action Allow -Program $exePath -Protocol TCP -LocalPort 443,17899 -Profile Any -ErrorAction SilentlyContinue | Out-Null
+New-NetFirewallRule -DisplayName "UURemoteTlsFix-LAN-UDP" -Direction Inbound -Action Allow -Program $exePath -Protocol UDP -LocalPort 53 -Profile Any -ErrorAction SilentlyContinue | Out-Null
+Write-Ok "已配置 Windows 防火墙局域网放行规则 (UDP :53 / TCP :443, :17899)"
 Write-Ok "已注册开机静默自启 (HKCU\...\Run\UURemoteTLSFragmenter)"
 
 # ----------------------------------------------------------------------
@@ -973,55 +2522,75 @@ Write-Ok "已注册开机静默自启 (HKCU\...\Run\UURemoteTLSFragmenter)"
 # ----------------------------------------------------------------------
 Write-Step "步骤 2/3: 写入腾讯 HTTPDNS 域名 hosts 规则并刷新系统 DNS 缓存"
 
-$existingHosts = @(Get-Content $hostsPath -ErrorAction SilentlyContinue | Where-Object {
+Backup-FileBeforeModify -sourcePath $hostsPath -backupDir $backupDir -prefix "hosts"
+
+$baseHosts = @(Get-Content -Path $hostsPath -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object {
     $_ -notmatch 'QQ_WECHAT_HTTPDNS_FIX' -and
-    $_ -notmatch '(^|\s)(dns\.qq\.com|dns\.weixin\.qq\.com|dns\.weixin\.qq\.com\.cn|httpdns\.kg\.qq\.com|dns\.wechat\.com)(\s|$)'
+    $_ -notmatch '^\s*(?:127\.0\.0\.1|0\.0\.0\.0|::1?)\s+(?:dns\.qq\.com|dns\.weixin\.qq\.com|dns\.weixin\.qq\.com\.cn|httpdns\.kg\.qq\.com|dns\.wechat\.com)(?:\s|$)'
 })
 
-if ($effectiveMode -eq "Fragment") {
-    foreach ($qd in $qqDomains) {
-        $existingHosts += "127.0.0.1 $qd # QQ_WECHAT_HTTPDNS_FIX"
-    }
-    Write-Ok "已将 5 个腾讯 HTTPDNS 域名映射至 127.0.0.1:443 (本机透明 TLS 双帧切分放通模式)"
-} else {
-    foreach ($qd in $qqDomains) {
-        $existingHosts += "0.0.0.0 $qd # QQ_WECHAT_HTTPDNS_FIX"
-        $existingHosts += ":: $qd # QQ_WECHAT_HTTPDNS_FIX"
-    }
-    Write-Ok "已将 5 个腾讯 HTTPDNS 域名映射至 0.0.0.0 / :: (毫秒级快速失败回退系统 DNS 模式)"
+$domainModes = @{}
+foreach ($qd in $qqDomains) {
+    $domainModes[$qd] = $effectiveMode
 }
 
-[System.IO.File]::WriteAllLines($hostsPath, $existingHosts, $utf8NoBom)
-& ipconfig.exe /flushdns | Out-Null
+function Sync-QqHostsRules([string[]]$baseLines, [hashtable]$modeMap) {
+    $outLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $baseLines) { [void]$outLines.Add($line) }
+    foreach ($qd in $qqDomains) {
+        if ($modeMap[$qd] -eq "Fragment") {
+            [void]$outLines.Add("127.0.0.1 $qd # QQ_WECHAT_HTTPDNS_FIX")
+        } else {
+            [void]$outLines.Add("0.0.0.0 $qd # QQ_WECHAT_HTTPDNS_FIX")
+            [void]$outLines.Add(":: $qd # QQ_WECHAT_HTTPDNS_FIX")
+        }
+    }
+    Write-LinesSafely -path $hostsPath -lines ($outLines.ToArray()) -encoding $utf8NoBom
+    & ipconfig.exe /flushdns | Out-Null
+}
+
+Sync-QqHostsRules -baseLines $baseHosts -modeMap $domainModes
+if ($effectiveMode -eq "Fragment") {
+    Write-Ok "已将 5 个腾讯 HTTPDNS 域名映射至 127.0.0.1:443 (本机透明 TLS 双帧切分放通模式)"
+} else {
+    Write-Ok "已将 5 个腾讯 HTTPDNS 域名映射至 0.0.0.0 / :: (毫秒级快速失败回退系统 DNS 模式)"
+}
 Write-Ok "系统 DNS 缓存已刷新"
 
 # ----------------------------------------------------------------------
-# 步骤 3/3: 端到端实测验证 5 个腾讯 HTTPDNS 域名响应耗时
+# 步骤 3/3: 端到端实测验证 5 个腾讯 HTTPDNS 域名响应耗时（Auto 模式自动单域降级）
 # ----------------------------------------------------------------------
 Write-Step "步骤 3/3: 实测全部 5 个腾讯/微信 HTTPDNS 域名响应耗时"
 
+$curlExe = Resolve-CurlExecutable
 $allPassed = $true
+$fallbackDomains = New-Object System.Collections.Generic.List[string]
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 
 foreach ($d in $qqDomains) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($effectiveMode -eq "Fragment") {
-        $code = & curl.exe -sS -k -o NUL -w "%{http_code}" --resolve "${d}:443:127.0.0.1" --max-time 6 "https://$d" 2>&1
+        if (-not $curlExe) {
+            $sw.Stop()
+            Write-Warn ("{0,-24} -> 未找到 curl.exe，跳过握手测速" -f $d)
+            continue
+        }
+        $code = & $curlExe -sS -k -o NUL -w "%{http_code}" --resolve "${d}:443:127.0.0.1" --max-time 6 "https://$d" 2>&1
         $sw.Stop()
-        if ($code -match '^\d{3}$' -and $code -ne '000') {
-            Write-Ok ("{0,-24} -> TLS 分片直连握手成功 ({1,3} ms) [HTTP {2}]" -f $d, $sw.ElapsedMilliseconds, $code)
+        $codeStr = ($code | Out-String).Trim()
+        if ($codeStr -match '^\d{3}$' -and $codeStr -ne '000') {
+            Write-Ok ("{0,-24} -> TLS 分片直连握手成功 ({1,3} ms) [HTTP {2}]" -f $d, $sw.ElapsedMilliseconds, $codeStr)
+        } elseif ($Mode -eq "Auto") {
+            Write-Warn ("{0,-24} -> 分片直连超时 ({1,3} ms)，Auto 模式将自动降级为 FastFail (0.0.0.0 秒回退)" -f $d, $sw.ElapsedMilliseconds)
+            $domainModes[$d] = "FastFail"
+            [void]$fallbackDomains.Add($d)
         } else {
-            Write-Warn ("{0,-24} -> 分片直连超时，自动为该域名启用快速回退 ({1,3} ms)" -f $d, $sw.ElapsedMilliseconds)
+            Write-Err ("{0,-24} -> 分片直连超时 ({1,3} ms)，可尝试改用 -Mode Auto 或 -Mode FastFail" -f $d, $sw.ElapsedMilliseconds)
             $allPassed = $false
         }
     } else {
-        $tc = New-Object System.Net.Sockets.TcpClient
-        try {
-            $tc.Connect($d, 443)
-        } catch {} finally {
-            $tc.Dispose()
-        }
+        $null = Test-TcpPortReady -targetHost $d -port 443 -timeoutMs 2000
         $sw.Stop()
         if ($sw.ElapsedMilliseconds -lt 500) {
             Write-Ok ("{0,-24} -> 快速失败秒回退生效 ({1,3} ms，零状态机阻塞)" -f $d, $sw.ElapsedMilliseconds)
@@ -1031,8 +2600,33 @@ foreach ($d in $qqDomains) {
         }
     }
 }
+
+# 若 Auto 模式下存在分片超时域名，真正更新系统 hosts 并刷新 DNS 复测确认生效
+if ($fallbackDomains.Count -gt 0) {
+    Sync-QqHostsRules -baseLines $baseHosts -modeMap $domainModes
+    if ($fallbackDomains.Count -eq $qqDomains.Count) {
+        [System.IO.File]::WriteAllText($modeFile, "fastfail", $utf8NoBom)
+        Write-Warn "全部 5 个域名均已切换至 FastFail，并同步更新局域网 DNS 模式为 fastfail"
+    }
+    foreach ($fd in $fallbackDomains) {
+        $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = Test-TcpPortReady -targetHost $fd -port 443 -timeoutMs 2000
+        $sw2.Stop()
+        if ($sw2.ElapsedMilliseconds -lt 500) {
+            Write-Ok ("{0,-24} -> 已降级为快速失败秒回退生效 ({1,3} ms)" -f $fd, $sw2.ElapsedMilliseconds)
+        } else {
+            Write-Err ("{0,-24} -> 降级后耗时仍异常 ({1,3} ms)" -f $fd, $sw2.ElapsedMilliseconds)
+            $allPassed = $false
+        }
+    }
+}
+
 $ErrorActionPreference = $prevEap
 
 Write-Host "`n======================================================================" -ForegroundColor Cyan
-Write-Host " 修复完成！QQ 与微信加载图片将不再卡顿等待 HTTPDNS 超时。" -ForegroundColor Green
+if ($allPassed) {
+    Write-Host " 修复完成！QQ 与微信加载图片将不再卡顿等待 HTTPDNS 超时。" -ForegroundColor Green
+} else {
+    Write-Host " 部分域名检测存在异常，请查看上方提示或使用 -Mode FastFail 重试。" -ForegroundColor Yellow
+}
 Write-Host "======================================================================" -ForegroundColor Cyan
